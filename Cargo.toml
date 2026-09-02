@@ -1,6 +1,6 @@
 [package]
 name = "xray"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2024"
 description = "HPC scientific Python linter for xarray, dask, and NumPy workflows"
 authors = ["greensh16 <greensh16@users.noreply.github.com>"]
@@ -35,6 +35,17 @@ path = "src/lib.rs"
 [[bench]]
 name = "throughput"
 harness = false
+
+[profile.release]
+# Published binaries carry no debug symbols: a stripped CLI is materially
+# smaller to download on an HPC login node, and a release backtrace is not
+# useful anyway — panics report their message either way.
+strip = true
+
+[profile.bench]
+# `bench` inherits from `release`, so stripping would take symbol names out of
+# perf/Instruments output and make `cargo bench` profiling useless. Opt back in.
+strip = false
 
 [dependencies]
 tree-sitter        = "0.26.7"

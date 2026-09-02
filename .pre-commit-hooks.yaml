@@ -4,7 +4,7 @@
 #
 #   repos:
 #     - repo: https://github.com/greensh16/xray
-#       rev: v1.0.1          # pin to a release tag
+#       rev: v1.1.0          # pin to a release tag
 #       hooks:
 #         - id: xray         # lint all staged Python files
 #

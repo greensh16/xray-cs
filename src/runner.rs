@@ -9,7 +9,7 @@ use crate::{
     cli::{Cli, MinSeverity, OutputFormat},
     config::Config,
     diagnostic::{Diagnostic, FileResults, RunResults, Severity},
-    diff,
+    diff, fix,
     ignore::IgnorePatterns,
     notebook, parser, rules,
 };
@@ -36,36 +36,7 @@ pub fn run(cli: &Cli, config: &Config) -> Result<RunResults> {
         eprintln!("xray: config warning: {msg}");
     }
 
-    // ── Collect paths ─────────────────────────────────────────────────────────
-    // Priority: --diff > positional paths > config [paths].include
-    let mut paths = if let Some(ref git_ref) = cli.diff {
-        diff::changed_python_files(git_ref)?
-    } else if cli.paths.is_empty() {
-        collect_paths(&config.paths.include)?
-    } else {
-        collect_paths(&cli.paths)?
-    };
-
-    // Apply config [paths].exclude globs (not applied to --diff lists, which
-    // are already a precise set of changed files)
-    if cli.diff.is_none() && !config.paths.exclude.is_empty() {
-        let exclude_pats: Vec<glob::Pattern> = config
-            .paths
-            .exclude
-            .iter()
-            .filter_map(|p| glob::Pattern::new(p).ok())
-            .collect();
-        paths.retain(|p| {
-            let path = std::path::Path::new(p);
-            !exclude_pats
-                .iter()
-                .any(|pat| pat.matches_path_with(path, GLOB_OPTS))
-        });
-    }
-
-    // Apply .xrayignore patterns
-    let ignore = IgnorePatterns::load(".");
-    paths.retain(|p| !ignore.is_ignored(p));
+    let paths = resolve_paths(cli, config, &cli.paths)?;
 
     // ── Lint files in parallel ────────────────────────────────────────────────
     let file_results: Vec<_> = paths
@@ -96,6 +67,42 @@ pub fn run(cli: &Cli, config: &Config) -> Result<RunResults> {
     }
 
     Ok(results)
+}
+
+/// Resolve the set of files to act on.
+///
+/// Priority: `--diff` > explicit paths > `[paths].include`, then
+/// `[paths].exclude` globs and `.xrayignore`. Shared by `run` and `run_fix` so
+/// `xray fix` never operates on a different file set than `xray` reports on.
+pub fn resolve_paths(cli: &Cli, config: &Config, explicit: &[String]) -> Result<Vec<String>> {
+    let mut paths = if let Some(ref git_ref) = cli.diff {
+        diff::changed_python_files(git_ref)?
+    } else if explicit.is_empty() {
+        collect_paths(&config.paths.include)?
+    } else {
+        collect_paths(explicit)?
+    };
+
+    // Exclude globs are not applied to `--diff` lists, which are already a
+    // precise set of changed files.
+    if cli.diff.is_none() && !config.paths.exclude.is_empty() {
+        let exclude_pats: Vec<glob::Pattern> = config
+            .paths
+            .exclude
+            .iter()
+            .filter_map(|p| glob::Pattern::new(p).ok())
+            .collect();
+        paths.retain(|p| {
+            let path = std::path::Path::new(p);
+            !exclude_pats
+                .iter()
+                .any(|pat| pat.matches_path_with(path, GLOB_OPTS))
+        });
+    }
+
+    let ignore = IgnorePatterns::load(".");
+    paths.retain(|p| !ignore.is_ignored(p));
+    Ok(paths)
 }
 
 // ── per-file lint helpers ─────────────────────────────────────────────────────
@@ -406,12 +413,28 @@ fn build_sarif_result(d: &Diagnostic) -> Value {
         }],
     });
 
-    // Attach a fix hint as a "fix" object if present
-    if let Some(ref hint) = d.fix_hint {
+    // A mechanical fix becomes a real SARIF `artifactChange`, which
+    // SARIF-aware tooling can apply. Previously every fix carried an empty
+    // `artifactChanges` array, which is well-formed but actionable by nothing.
+    if let Some(ref fix) = d.fix {
         result["fixes"] = json!([{
-            "description": { "text": hint },
-            "artifactChanges": [],
+            "description": { "text": fix.description },
+            "artifactChanges": [{
+                "artifactLocation": { "uri": d.file, "uriBaseId": "SRCROOT" },
+                "replacements": [{
+                    "deletedRegion": {
+                        "startLine": fix.start_line,
+                        "startColumn": fix.start_column,
+                        "endLine": fix.end_line,
+                        "endColumn": fix.end_column,
+                    },
+                    "insertedContent": { "text": fix.replacement },
+                }],
+            }],
         }]);
+    } else if let Some(ref hint) = d.fix_hint {
+        // Advisory only: no verified rewrite, so no artifactChanges to offer.
+        result["fixes"] = json!([{ "description": { "text": hint } }]);
     }
 
     // Attach docs URL as a related location / help URI
@@ -514,7 +537,40 @@ fn severity_passes(sev: &Severity, min: &MinSeverity) -> bool {
     }
 }
 
-fn print_rule_list() {
+/// Emit every rule's metadata as JSON.
+///
+/// This is the source of truth for generated documentation: the README table,
+/// `docs/rules/*.md` and the wiki all describe the same 33 rules, and keeping
+/// four hand-maintained copies in sync is what produced the drift found in the
+/// v1.0 review. Fields are joined from `RuleMeta` (id, name, severity,
+/// description) and `ExplainEntry` (domain, docs URL, auto-fix eligibility).
+pub fn print_rule_list_json() -> Result<()> {
+    let entries: Vec<Value> = rules::all_meta()
+        .iter()
+        .map(|m| {
+            let ex = crate::explain::entry_for(m.id);
+            json!({
+                "id": m.id,
+                "name": m.name,
+                "severity": m.severity.to_string(),
+                "description": m.description,
+                "domain": ex.map(|e| e.domain),
+                "url": ex.and_then(|e| e.url),
+                "fix_eligible": crate::fix::is_fixable(m.id),
+            })
+        })
+        .collect();
+
+    let out = json!({
+        "schema_version": JSON_SCHEMA_VERSION,
+        "tool": { "name": "xray", "version": env!("CARGO_PKG_VERSION") },
+        "rules": entries,
+    });
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+pub fn print_rule_list() {
     let meta = rules::all_meta();
     println!("{:<8} {:<10} {:<35} DESCRIPTION", "ID", "SEVERITY", "NAME");
     println!("{}", "─".repeat(100));
@@ -697,4 +753,105 @@ fn line_col_to_offset(source: &str, line: usize, col: usize) -> usize {
         char_offset += l.chars().count() + 1;
     }
     char_offset
+}
+
+// ── xray fix ──────────────────────────────────────────────────────────────────
+
+/// Summary of a `xray fix` run.
+#[derive(Debug, Default)]
+pub struct FixSummary {
+    pub files_changed: usize,
+    pub fixes_applied: usize,
+    pub fixes_skipped: usize,
+    /// Notebooks encountered, which are never rewritten.
+    pub notebooks_skipped: usize,
+}
+
+/// Apply every available auto-fix across the resolved file set.
+///
+/// Prints a diff for each file it touches. With `dry_run` nothing is written —
+/// the diff is the whole output.
+///
+/// Notebooks are reported and skipped: fix offsets are into a cell's extracted
+/// source, and splicing those back into the `.ipynb` JSON is a different
+/// problem from editing a `.py` file.
+pub fn run_fix(
+    cli: &Cli,
+    config: &Config,
+    explicit: &[String],
+    dry_run: bool,
+) -> Result<FixSummary> {
+    let all_ids: Vec<&str> = rules::all_meta().iter().map(|m| m.id).collect();
+    for msg in config.validate(&all_ids) {
+        eprintln!("xray: config warning: {msg}");
+    }
+
+    let paths = resolve_paths(cli, config, explicit)?;
+    let mut summary = FixSummary::default();
+
+    for path in &paths {
+        if path.ends_with(".ipynb") {
+            summary.notebooks_skipped += 1;
+            continue;
+        }
+
+        // Read raw so the original line endings can be restored on write.
+        let Ok(raw) = std::fs::read(path) else {
+            eprintln!("xray: cannot read {path}");
+            continue;
+        };
+        let raw = String::from_utf8_lossy(&raw).into_owned();
+
+        let Ok(parsed) = parser::parse_source(raw.clone()) else {
+            eprintln!("xray: could not parse {path} — skipping");
+            continue;
+        };
+        let mut diags = rules::run_all(&parsed, path, config);
+        // Same filters as linting, so `xray fix` changes exactly what `xray`
+        // reports — a rule you disabled is not quietly rewritten anyway.
+        apply_filters(&mut diags, config, cli);
+        if diags.iter().all(|d| d.fix.is_none()) {
+            continue;
+        }
+
+        // `parsed.source` is the CRLF-normalised text the fix offsets index.
+        let outcome = fix::apply(&parsed.source, &diags);
+        summary.fixes_applied += outcome.applied;
+        summary.fixes_skipped += outcome.skipped_overlapping;
+        if !outcome.changed() {
+            continue;
+        }
+
+        summary.files_changed += 1;
+        print!("{}", fix::render_diff(path, &outcome));
+
+        if !dry_run {
+            let to_write = fix::restore_line_endings(&raw, &outcome.fixed);
+            if let Err(e) = std::fs::write(path, to_write) {
+                eprintln!("xray: cannot write {path}: {e}");
+            }
+        }
+    }
+
+    let verb = if dry_run { "would apply" } else { "applied" };
+    println!(
+        "\nxray: {verb} {} fix(es) across {} file(s).",
+        summary.fixes_applied, summary.files_changed
+    );
+    if summary.fixes_skipped > 0 {
+        println!(
+            "xray: skipped {} overlapping fix(es) — rerun to apply them.",
+            summary.fixes_skipped
+        );
+    }
+    if summary.notebooks_skipped > 0 {
+        println!(
+            "xray: skipped {} notebook(s) — `xray fix` does not rewrite .ipynb files.",
+            summary.notebooks_skipped
+        );
+    }
+    if dry_run && summary.files_changed > 0 {
+        println!("xray: --dry-run, nothing written.");
+    }
+    Ok(summary)
 }

@@ -1,6 +1,6 @@
 name: Release
 
-# Triggered when a version tag is pushed (e.g. v1.0.1).
+# Triggered when a version tag is pushed (e.g. v1.1.0).
 # Tags should only be pushed after CI is green on main.
 on:
   push:

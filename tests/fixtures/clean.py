@@ -27,12 +27,12 @@ point = ds.sel(lat=45.0, lon=-120.5, method="nearest")
 ds_hot = ds.persist()
 results = []
 for year in range(2000, 2024):
-    results.append(ds_hot.sel(time=str(year)).mean().compute())  # xray: disable=DK001,DK004,XR005
+    results.append(ds_hot.sel(time=str(year)).mean().compute())  # xray: disable=DK001,XR005
 
 # DK003 OK: single compute on the final combined result
 a = da.ones((1000, 1000), chunks=100)
 b = da.zeros((1000, 1000), chunks=100)
-combined = (a + b).mean().compute()  # xray: disable=DK004
+combined = (a + b).mean().compute()
 
 # NP001 OK: vectorised operation
 import pandas as pd

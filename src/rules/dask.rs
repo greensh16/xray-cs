@@ -5,6 +5,7 @@ use tree_sitter::{Query, QueryCursor};
 use crate::{
     config::Config,
     diagnostic::{Diagnostic, RuleMeta, Severity},
+    fix::Fix,
     parser::{
         ParsedFile, call_is_from, is_inside_loop, keyword_arg_present_or_unknown, node_text,
         position,
@@ -280,8 +281,7 @@ impl RuleSet for DaskRules {
                         }
                         if !keyword_arg_present_or_unknown(call_node, source, "chunks") {
                             let (line, col) = position(&call_node);
-                            diags.push(
-                                Diagnostic::new(
+                            let mut diag = Diagnostic::new(
                                     "DK007",
                                     Severity::Warning,
                                     path,
@@ -291,8 +291,19 @@ impl RuleSet for DaskRules {
                                 )
                                 .with_suggestion("Add `chunks=` matching your array shape, e.g. `chunks=(1000, 1000)` or `chunks='auto'`")
                                 .with_fix_hint("da.from_array(arr, chunks=\"auto\")")
-                                .with_url("https://docs.dask.org/en/stable/array-creation.html"),
-                            );
+                                .with_url("https://docs.dask.org/en/stable/array-creation.html");
+
+                            if let Some((at, sep)) =
+                                crate::parser::kwarg_insertion_point(call_node, source)
+                            {
+                                diag = diag.with_fix(Fix::insert(
+                                    &file.source,
+                                    at,
+                                    format!("{sep}chunks=\"auto\""),
+                                    "add chunks=\"auto\"",
+                                ));
+                            }
+                            diags.push(diag);
                         }
                     }
                 }

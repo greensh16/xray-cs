@@ -5,6 +5,7 @@ use tree_sitter::{Query, QueryCursor};
 use crate::{
     config::Config,
     diagnostic::{Diagnostic, RuleMeta, Severity},
+    fix::Fix,
     parser::{
         ParsedFile, call_module, is_inside_loop, keyword_arg_present_or_unknown, node_text,
         position,
@@ -262,12 +263,31 @@ impl RuleSet for NumpyRules {
                                 ),
                             )
                         };
-                        diags.push(
+                        let mut diag =
                             Diagnostic::new("NP004", severity, path, line, col, message)
                                 .with_suggestion(format!("Replace with `np.{fn_name}(array)` to operate on the whole array at once"))
                                 .with_fix_hint(format!("np.{fn_name}(array)"))
-                                .with_url("https://github.com/greensh16/xray/wiki/NumPy-Pandas-Rules#np004"),
-                        );
+                                .with_url("https://github.com/greensh16/xray/wiki/NumPy-Pandas-Rules#np004");
+
+                        // Rewrite `math.sqrt` to whatever *this file* calls
+                        // numpy. Offering `np.sqrt` in a file that imported
+                        // numpy under another name would produce a NameError,
+                        // so the fix is withheld unless the binding is known.
+                        if let Some(alias) = file.imports.binding_for_module("numpy")
+                            && let Some(recv) = node
+                                .child_by_field_name("function")
+                                .and_then(|f| f.child_by_field_name("object"))
+                            && node_text(&recv, source) == "math"
+                        {
+                            diag = diag.with_fix(Fix::new(
+                                &file.source,
+                                recv.start_byte(),
+                                recv.end_byte(),
+                                alias,
+                                format!("replace math.{fn_name} with {alias}.{fn_name}"),
+                            ));
+                        }
+                        diags.push(diag);
                     }
                 }
 
@@ -311,8 +331,7 @@ impl RuleSet for NumpyRules {
                             continue;
                         }
                         let (line, col) = position(&node);
-                        diags.push(
-                            Diagnostic::new(
+                        let mut diag = Diagnostic::new(
                                 "NP006",
                                 Severity::Warning,
                                 path,
@@ -322,8 +341,23 @@ impl RuleSet for NumpyRules {
                             )
                             .with_suggestion("Replace with `np.array(...)` — use `@` for matrix multiplication and `.T` for transpose")
                             .with_fix_hint("np.array(data)")
-                            .with_url("https://numpy.org/doc/stable/reference/generated/numpy.matrix.html"),
-                        );
+                            .with_url("https://numpy.org/doc/stable/reference/generated/numpy.matrix.html");
+
+                        // Rewrite only the attribute, leaving the receiver and
+                        // arguments exactly as written.
+                        if let Some(attr) = node
+                            .child_by_field_name("function")
+                            .and_then(|f| f.child_by_field_name("attribute"))
+                        {
+                            diag = diag.with_fix(Fix::new(
+                                &file.source,
+                                attr.start_byte(),
+                                attr.end_byte(),
+                                "array",
+                                "replace matrix() with array()",
+                            ));
+                        }
+                        diags.push(diag);
                     }
                 }
 
@@ -334,8 +368,7 @@ impl RuleSet for NumpyRules {
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
                         let (line, col) = position(&node);
-                        diags.push(
-                            Diagnostic::new(
+                        let mut diag = Diagnostic::new(
                                 "NP007",
                                 Severity::Warning,
                                 path,
@@ -345,8 +378,22 @@ impl RuleSet for NumpyRules {
                             )
                             .with_suggestion("Replace `.applymap(fn)` with `.map(fn)`")
                             .with_fix_hint(".map(fn)")
-                            .with_url("https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.map.html"),
-                        );
+                            .with_url("https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.map.html");
+
+                        // A pure rename: same signature, same semantics.
+                        if let Some(attr) = node
+                            .child_by_field_name("function")
+                            .and_then(|f| f.child_by_field_name("attribute"))
+                        {
+                            diag = diag.with_fix(Fix::new(
+                                &file.source,
+                                attr.start_byte(),
+                                attr.end_byte(),
+                                "map",
+                                "rename applymap() to map()",
+                            ));
+                        }
+                        diags.push(diag);
                     }
                 }
 

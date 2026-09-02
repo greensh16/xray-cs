@@ -2012,3 +2012,171 @@ fn crlf_and_lf_sources_produce_identical_diagnostics() {
         .collect();
     assert_eq!(a, b, "line endings must not shift diagnostic positions");
 }
+
+// ── v1.1: auto-fix ───────────────────────────────────────────────────────────
+
+/// Lint a source string and apply every fix, as `xray fix` would.
+fn fix_source(source: &str) -> String {
+    let parsed = parser::parse_source(source.to_string()).unwrap();
+    let config = Config::default();
+    let diags = rules::run_all(&parsed, "<inline>", &config);
+    xray::fix::apply(&parsed.source, &diags).fixed
+}
+
+#[test]
+fn fixing_the_bad_fixture_reproduces_the_fixed_fixture() {
+    let bad = std::fs::read_to_string("tests/fixtures/fix_bad.py").unwrap();
+    let expected = std::fs::read_to_string("tests/fixtures/fix_fixed.py").unwrap();
+    assert_eq!(fix_source(&bad), expected);
+}
+
+#[test]
+fn the_fixed_fixture_reports_none_of_the_fixed_rules() {
+    let diags = check_fixture("fix_fixed.py");
+    for id in xray::fix::FIXABLE_RULES {
+        assert!(
+            !diags.iter().any(|d| d.rule_id == *id),
+            "{id} still fires on the fixed fixture: {diags:?}"
+        );
+    }
+}
+
+#[test]
+fn fixes_are_idempotent() {
+    let bad = std::fs::read_to_string("tests/fixtures/fix_bad.py").unwrap();
+    let once = fix_source(&bad);
+    assert_eq!(
+        fix_source(&once),
+        once,
+        "a second pass changed the file again"
+    );
+}
+
+#[test]
+fn every_fix_produces_a_parseable_file() {
+    // A fix that yields invalid Python is worse than no fix at all.
+    let bad = std::fs::read_to_string("tests/fixtures/fix_bad.py").unwrap();
+    let fixed = fix_source(&bad);
+    let parsed = parser::parse_source(fixed).unwrap();
+    assert!(
+        !parsed.tree.root_node().has_error(),
+        "fixed source does not parse cleanly"
+    );
+}
+
+#[test]
+fn keyword_insertion_handles_empty_and_trailing_comma_arguments() {
+    let out = fix_source(
+        "import xarray as xr\n\
+         a = xr.open_dataset()\n\
+         b = xr.open_dataset('x.nc',)\n\
+         c = xr.open_dataset('y.nc')\n",
+    );
+    assert!(out.contains("open_dataset(chunks=\"auto\")"), "{out}");
+    assert!(
+        out.contains("open_dataset('x.nc', chunks=\"auto\")"),
+        "{out}"
+    );
+    assert!(
+        out.contains("open_dataset('y.nc', chunks=\"auto\")"),
+        "{out}"
+    );
+}
+
+#[test]
+fn np004_fix_uses_this_files_numpy_binding() {
+    // `np.sqrt` would be a NameError in a file that imported numpy plainly.
+    let out = fix_source(
+        "import math\nimport numpy\narr = numpy.arange(4, dtype=numpy.float32)\nx = math.sqrt(arr)\n",
+    );
+    assert!(out.contains("numpy.sqrt(arr)"), "{out}");
+}
+
+#[test]
+fn xr009_fix_preserves_the_files_quote_style() {
+    let out = fix_source("import xarray as xr\nc = xr.apply_ufunc(len, d, dask='allowed')\n");
+    assert!(out.contains("dask='parallelized'"), "{out}");
+}
+
+#[test]
+fn rules_without_a_verified_rewrite_carry_no_fix() {
+    // NP002's rewrite spans statements; XR006 needs a dimension name.
+    let parsed = parser::parse_source(
+        "import xarray as xr\nimport pandas as pd\n\
+         a = xr.open_dataset('a.nc', chunks='auto').to_array()\n\
+         for f in files:\n    out = pd.concat([out, f])\n"
+            .to_string(),
+    )
+    .unwrap();
+    let diags = rules::run_all(&parsed, "<inline>", &Config::default());
+    for d in &diags {
+        if matches!(d.rule_id, "NP002" | "XR006") {
+            assert!(d.fix.is_none(), "{} must not carry a fix", d.rule_id);
+        }
+    }
+}
+
+// ── v1.1: per-file-ignores, extends, XR000 ───────────────────────────────────
+
+#[test]
+fn per_file_ignores_disables_named_rules_by_glob() {
+    let mut config = Config::default();
+    config
+        .per_file_ignores
+        .insert("**/tests/**".into(), vec!["XR001".into()]);
+    let parsed =
+        parser::parse_source("import xarray as xr\nds = xr.open_dataset('a.nc')\n".to_string())
+            .unwrap();
+
+    let in_tests = rules::run_all(&parsed, "proj/tests/test_a.py", &config);
+    assert!(!in_tests.iter().any(|d| d.rule_id == "XR001"));
+
+    let in_src = rules::run_all(&parsed, "proj/src/a.py", &config);
+    assert!(in_src.iter().any(|d| d.rule_id == "XR001"));
+}
+
+#[test]
+fn per_file_ignores_star_disables_everything() {
+    let mut config = Config::default();
+    config
+        .per_file_ignores
+        .insert("**/vendor/**".into(), vec!["*".into()]);
+    let parsed =
+        parser::parse_source("import xarray as xr\nds = xr.open_dataset('a.nc')\n".to_string())
+            .unwrap();
+    assert!(rules::run_all(&parsed, "vendor/a.py", &config).is_empty());
+}
+
+#[test]
+fn xr000_reports_only_suppressions_that_matched_nothing() {
+    let diags = check_src(
+        "import xarray as xr\n\
+         ds = xr.open_dataset('a.nc')  # xray: disable=XR001\n\
+         total = 1 + 1  # xray: disable=DK001\n",
+    );
+    let xr000: Vec<_> = diags.iter().filter(|d| d.rule_id == "XR000").collect();
+    assert_eq!(xr000.len(), 1, "{diags:?}");
+    assert_eq!(xr000[0].line, 3);
+    assert!(xr000[0].message.contains("DK001"));
+}
+
+#[test]
+fn xr000_ignores_file_level_suppressions() {
+    // `disable-file=` legitimately guards a file that is currently clean.
+    let diags = check_src("# xray: disable-file=XR001\nimport xarray as xr\nx = 1\n");
+    assert!(!diags.iter().any(|d| d.rule_id == "XR000"));
+}
+
+#[test]
+fn xr000_can_itself_be_disabled() {
+    let mut config = Config::default();
+    config.disable.insert("XR000".into());
+    let parsed =
+        parser::parse_source("import xarray as xr\ntotal = 1  # xray: disable=DK001\n".to_string())
+            .unwrap();
+    assert!(
+        !rules::run_all(&parsed, "a.py", &config)
+            .iter()
+            .any(|d| d.rule_id == "XR000")
+    );
+}

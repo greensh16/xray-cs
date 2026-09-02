@@ -12,6 +12,12 @@ pub struct ExplainEntry {
     pub fix_eligible: bool,
 }
 
+/// The entry for a rule ID, if one exists. Case-insensitive.
+pub fn entry_for(rule_id: &str) -> Option<&'static ExplainEntry> {
+    let upper = rule_id.to_uppercase();
+    ENTRIES.iter().find(|e| e.id == upper.as_str())
+}
+
 /// Print a formatted explanation for the given rule ID.
 /// Returns `false` if the rule ID is unknown.
 pub fn explain(rule_id: &str) -> bool {
@@ -66,6 +72,28 @@ fn print_entry(e: &ExplainEntry) {
 /// All rule explanation entries, in domain order.
 static ENTRIES: &[ExplainEntry] = &[
     // ── xarray ────────────────────────────────────────────────────────────────
+    ExplainEntry {
+        id: "XR000",
+        name: "stale-suppression",
+        severity: "hint",
+        domain: "suppressions",
+        rationale: "\
+A `# xray: disable=RULE` comment that suppressed nothing is dead weight, and
+worse than dead: the line it guards will change, and the comment will go on
+silencing whatever that line becomes.  Nothing else reports these, so they
+accumulate quietly as the code under them moves on.
+
+Only line-level suppressions are checked.  `disable-file=` legitimately covers a
+file that happens to have no violations right now, and flagging it would punish
+exactly the defensive use it exists for.",
+        bad_example: "\
+# the loop was refactored away; the suppression outlived it
+total = ds.sum()  # xray: disable=DK001",
+        good_example: "\
+total = ds.sum()",
+        url: Some("https://github.com/greensh16/xray/wiki/Suppressions"),
+        fix_eligible: false,
+    },
     ExplainEntry {
         id: "XR001",
         name: "open-dataset-without-chunks",
@@ -177,7 +205,7 @@ stacked2 = ds.to_dataarray()      # same issue",
         good_example: "\
 stacked = ds.to_array(dim=\"variable\")    # explicit — intent is clear",
         url: Some("https://docs.xarray.dev/en/stable/generated/xarray.Dataset.to_array.html"),
-        fix_eligible: true,
+        fix_eligible: false,
     },
     ExplainEntry {
         id: "XR007",
@@ -715,6 +743,43 @@ ds = xr.open_dataset(\"large.nc\", chunks=\"auto\", engine=\"scipy\")
         good_example: "\
 ds = xr.open_dataset(\"large.nc\", chunks=\"auto\", engine=\"netcdf4\")",
         url: Some("https://docs.xarray.dev/en/stable/generated/xarray.open_dataset.html"),
-        fix_eligible: true,
+        fix_eligible: false,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_rule_has_an_explain_entry() {
+        // `xray explain <ID>` must work for every rule --list-rules shows.
+        for meta in crate::rules::all_meta() {
+            assert!(
+                ENTRIES.iter().any(|e| e.id == meta.id),
+                "no ExplainEntry for {}",
+                meta.id
+            );
+        }
+    }
+
+    #[test]
+    fn no_explain_entry_is_orphaned() {
+        let known: Vec<&str> = crate::rules::all_meta().iter().map(|m| m.id).collect();
+        for e in ENTRIES {
+            assert!(known.contains(&e.id), "ExplainEntry {} has no rule", e.id);
+        }
+    }
+
+    #[test]
+    fn unknown_ids_return_false_so_main_exits_two() {
+        // `explain` prints the error itself; main must not print a second one.
+        assert!(!explain("NOPE"));
+        assert!(explain("XR001"));
+    }
+
+    #[test]
+    fn rule_ids_are_case_insensitive() {
+        assert!(explain("xr001"));
+    }
+}

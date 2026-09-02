@@ -47,7 +47,7 @@ inputs:
 
   xray-version:
     description: >
-      xray release tag to install (e.g. v1.0.1).
+      xray release tag to install (e.g. v1.1.0).
       Defaults to the latest published release.
     required: false
     default: 'latest'

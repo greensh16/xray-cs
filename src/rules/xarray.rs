@@ -6,6 +6,7 @@ use crate::{
     bindings::Origin,
     config::Config,
     diagnostic::{Diagnostic, RuleMeta, Severity},
+    fix::Fix,
     parser,
     parser::{
         ParsedFile, call_is_from, has_keyword_arg, is_inside_loop, keyword_arg_present_or_unknown,
@@ -170,7 +171,7 @@ impl RuleSet for XarrayRules {
                             .map(|n| node_text(&n, source))
                             .unwrap_or("open_dataset");
 
-                        diags.push(
+                        let mut diag =
                             Diagnostic::new(
                                 "XR001",
                                 Severity::Warning,
@@ -181,8 +182,19 @@ impl RuleSet for XarrayRules {
                             )
                             .with_suggestion("Add `chunks='auto'` or a dict matching your storage chunk layout")
                             .with_fix_hint(format!("{fn_text}(path, chunks=\"auto\")"))
-                            .with_url("https://docs.xarray.dev/en/stable/user-guide/dask.html"),
-                        );
+                            .with_url("https://docs.xarray.dev/en/stable/user-guide/dask.html");
+
+                        // Auto-fix: insert the keyword rather than rewriting the
+                        // call, so any existing arguments and formatting survive.
+                        if let Some((at, sep)) = parser::kwarg_insertion_point(call_node, source) {
+                            diag = diag.with_fix(Fix::insert(
+                                &file.source,
+                                at,
+                                format!("{sep}chunks=\"auto\""),
+                                "add chunks=\"auto\"",
+                            ));
+                        }
+                        diags.push(diag);
                     }
                 }
 
@@ -418,8 +430,7 @@ impl RuleSet for XarrayRules {
                             continue;
                         }
                         let (line, col) = position(&call_node);
-                        diags.push(
-                            Diagnostic::new(
+                        let mut diag = Diagnostic::new(
                                 "XR008",
                                 Severity::Warning,
                                 path,
@@ -429,8 +440,22 @@ impl RuleSet for XarrayRules {
                             )
                             .with_suggestion("Add `parallel=True` to open files concurrently using `dask.delayed`")
                             .with_fix_hint("open_mfdataset(paths, parallel=True, chunks=\"auto\")")
-                            .with_url("https://docs.xarray.dev/en/stable/generated/xarray.open_mfdataset.html"),
-                        );
+                            .with_url("https://docs.xarray.dev/en/stable/generated/xarray.open_mfdataset.html");
+
+                        // A `parallel=` set to something other than True is a
+                        // deliberate choice; only insert when it is absent.
+                        if parallel_val.is_none()
+                            && let Some((at, sep)) =
+                                parser::kwarg_insertion_point(call_node, source)
+                        {
+                            diag = diag.with_fix(Fix::insert(
+                                &file.source,
+                                at,
+                                format!("{sep}parallel=True"),
+                                "add parallel=True",
+                            ));
+                        }
+                        diags.push(diag);
                     }
                 }
 
@@ -452,8 +477,7 @@ impl RuleSet for XarrayRules {
                             continue;
                         }
                         let (line, col) = position(&call_node);
-                        diags.push(
-                            Diagnostic::new(
+                        let mut diag = Diagnostic::new(
                                 "XR009",
                                 Severity::Warning,
                                 path,
@@ -463,8 +487,25 @@ impl RuleSet for XarrayRules {
                             )
                             .with_suggestion("Replace `dask='allowed'` with `dask='parallelized'` and specify `output_dtypes=[...]`")
                             .with_fix_hint("apply_ufunc(func, *args, dask=\"parallelized\", output_dtypes=[float])")
-                            .with_url("https://docs.xarray.dev/en/stable/generated/xarray.apply_ufunc.html"),
-                        );
+                            .with_url("https://docs.xarray.dev/en/stable/generated/xarray.apply_ufunc.html");
+
+                        // Swap the literal in place, preserving the quote style
+                        // the file already uses.
+                        if let Some(v) = parser::keyword_arg_value_node(call_node, source, "dask") {
+                            let quote = if node_text(&v, source).starts_with('\'') {
+                                '\''
+                            } else {
+                                '"'
+                            };
+                            diag = diag.with_fix(Fix::new(
+                                &file.source,
+                                v.start_byte(),
+                                v.end_byte(),
+                                format!("{quote}parallelized{quote}"),
+                                "use dask=\"parallelized\"",
+                            ));
+                        }
+                        diags.push(diag);
                     }
                 }
 

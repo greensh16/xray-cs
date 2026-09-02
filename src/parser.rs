@@ -50,6 +50,24 @@ impl ImportContext {
         self.from_imports.get(name).map(String::as_str)
     }
 
+    /// The name this file binds `module` to — `"numpy"` → `"np"`.
+    ///
+    /// Needed by auto-fixes that must emit a reference valid *in this file*:
+    /// rewriting `math.sqrt` to `np.sqrt` is only correct if `np` is what this
+    /// file actually calls numpy. Returns `None` when the module is not
+    /// imported, which is precisely when the fix must not be offered.
+    ///
+    /// Deterministic: a module bound more than once (`import numpy` plus
+    /// `import numpy as np`) yields the lexicographically smallest binding
+    /// rather than whichever the hash map happened to yield first.
+    pub fn binding_for_module(&self, module: &str) -> Option<&str> {
+        self.aliases
+            .iter()
+            .filter(|(_, m)| m.as_str() == module)
+            .map(|(b, _)| b.as_str())
+            .min()
+    }
+
     /// Scan the top-level import statements using AST node traversal to build
     /// the context. This avoids false positives from string literals or
     /// comments that happen to contain library names.
@@ -390,6 +408,32 @@ pub fn call_is_from(
     call_module(call_node, source, imports) == Some(module)
 }
 
+/// Where a new keyword argument can be inserted into `call_node`.
+///
+/// Returns the byte offset just before the closing `)` and the separator to
+/// prefix, so the caller emits well-spaced code in all three shapes:
+/// `f()` → none, `f(a)` → `", "`, `f(a,)` → `" "`.
+pub fn kwarg_insertion_point(call_node: Node<'_>, source: &[u8]) -> Option<(usize, &'static str)> {
+    let args = call_node.child_by_field_name("arguments")?;
+    if args.kind() != "argument_list" {
+        return None;
+    }
+    let text = node_text(&args, source);
+    if !text.ends_with(')') {
+        return None;
+    }
+    let at = args.end_byte() - 1;
+    let inner = text[1..text.len() - 1].trim_end();
+    let sep = if inner.is_empty() {
+        ""
+    } else if inner.ends_with(',') {
+        " "
+    } else {
+        ", "
+    };
+    Some((at, sep))
+}
+
 /// Does the call forward `**kwargs`?
 ///
 /// When it does, a "missing keyword argument" rule cannot know whether the
@@ -415,6 +459,30 @@ pub fn has_dictionary_splat(call_node: Node<'_>) -> bool {
 pub fn keyword_arg_present_or_unknown(call_node: Node<'_>, source: &[u8], kw: &str) -> bool {
     has_keyword_arg(call_node, source, kw) || has_dictionary_splat(call_node)
 }
+/// The value **node** of keyword argument `kw`, for fixes that rewrite it in
+/// place rather than re-emitting the whole call.
+pub fn keyword_arg_value_node<'t>(
+    call_node: Node<'t>,
+    source: &[u8],
+    kw: &str,
+) -> Option<Node<'t>> {
+    let mut cursor = call_node.walk();
+    for child in call_node.children(&mut cursor) {
+        if child.kind() == "argument_list" {
+            let mut arg_cursor = child.walk();
+            for arg in child.children(&mut arg_cursor) {
+                if arg.kind() == "keyword_argument"
+                    && let Some(name_node) = arg.child_by_field_name("name")
+                    && node_text(&name_node, source) == kw
+                {
+                    return arg.child_by_field_name("value");
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Returns the raw source text of the value of the keyword argument named `kw`
 /// in `call_node`, or `None` if no such keyword argument exists.
 /// The returned text includes quotes for string literals (e.g. `"scipy"`).

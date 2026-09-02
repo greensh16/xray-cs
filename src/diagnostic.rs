@@ -1,3 +1,4 @@
+use crate::fix::Fix;
 use serde::Serialize;
 
 /// Rule identifier, e.g. "XR001"
@@ -44,6 +45,10 @@ pub struct Diagnostic {
     /// e.g. `chunks="auto"` or `np.sqrt(arr)`.  Omitted from JSON when None.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix_hint: Option<String>,
+    /// A mechanical edit `xray fix` can apply. Present only for rules whose
+    /// rewrite is verifiable syntactically — see `src/fix.rs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<Fix>,
     pub url: Option<&'static str>,
     /// For Jupyter notebook cells the file path is a display label like
     /// `notebook.ipynb:cell[3]` that cannot be read from disk.  When set,
@@ -71,6 +76,7 @@ impl Diagnostic {
             message: message.into(),
             suggestion: None,
             fix_hint: None,
+            fix: None,
             url: None,
             source_override: None,
         }
@@ -83,6 +89,12 @@ impl Diagnostic {
 
     pub fn with_fix_hint(mut self, hint: impl Into<String>) -> Self {
         self.fix_hint = Some(hint.into());
+        self
+    }
+
+    /// Attach a mechanical edit that `xray fix` can apply.
+    pub fn with_fix(mut self, fix: Fix) -> Self {
+        self.fix = Some(fix);
         self
     }
 
@@ -108,6 +120,7 @@ impl Diagnostic {
 }
 
 /// Static metadata about a rule — used for --list-rules and xray explain
+#[derive(Debug, Clone)]
 pub struct RuleMeta {
     pub id: RuleId,
     pub name: &'static str,

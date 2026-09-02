@@ -9,6 +9,69 @@ xray uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+---
+
+## [1.1.0] — 2026-09-02
+
+The v1.1 milestone: auto-fix and developer experience, plus the accuracy and
+hardening work that closed the post-1.0 review.
+
+No rule IDs, config keys or output schemas changed incompatibly. One behavioural
+change is worth reading before upgrading: **DK004 no longer flags
+`ds.mean().compute()`** — see *Changed* below.
+
+### Added — v1.1 milestone
+
+- **`xray fix`** — applies mechanical rewrites in place, printing a unified diff
+  of every change. `xray <paths> --fix` is the inline spelling; `--dry-run`
+  shows the diff without writing. Seven rules carry a fix: **XR001** and
+  **DK007** (insert `chunks="auto"`), **XR008** (`parallel=True`), **XR009**
+  (`dask="parallelized"`), **NP004** (`math.*` → the file's numpy binding),
+  **NP006** (`matrix()` → `array()`) and **NP007** (`applymap()` → `map()`).
+
+  Fixes are deliberately narrow. Each is an intra-line edit; the result is
+  asserted to parse, fixes are idempotent, overlapping edits are dropped rather
+  than merged, original line endings and quote style are preserved, and
+  notebooks are never rewritten. Rules whose rewrite would restructure code
+  (**NP002**) or require a judgement call (**XR006**'s dimension name,
+  **IO006**'s engine swap needing a package that may not be installed) stay
+  advisory — `src/fix.rs` records why for each.
+
+- **Fix annotations in JSON and SARIF.** Diagnostics gain a `fix` object, and
+  SARIF results now carry real `artifactChanges`/`replacements` that
+  SARIF-aware tooling can apply. Previously every SARIF fix had an empty
+  `artifactChanges` array, which is well-formed but actionable by nothing.
+
+- **`xray doctor <file>`** — explains why xray did or did not fire on a file:
+  resolved import context and the domains it gates, which `xray.toml` is in
+  effect and where it came from, matching exclusions, suppressions, and what
+  actually fired. Aimed at the most opaque failure mode in the architecture — a
+  file whose only `import xarray` sits inside a function body reports nothing
+  and exits 0, indistinguishable from a clean file.
+
+- **`xray rules [--format json]`** — machine-readable rule metadata (id, name,
+  domain, severity, description, docs URL, `fix_eligible`). This is now the
+  source of truth for generated documentation; the README rule tables are
+  generated from it rather than hand-maintained, which is what produced the
+  drift found in the v1.0 review.
+
+- **`extends` in `xray.toml`** — inherit a shared config, resolved relative to
+  the declaring file. Local keys override inherited ones; `disable`,
+  `severity_overrides` and `per_file_ignores` merge rather than replace, so
+  extending a profile never silently drops its rules. Cycles are reported with
+  the full chain. Remote URLs are deliberately unsupported — see
+  `docs/configuration.md` for why.
+
+- **`[per_file_ignores]` in `xray.toml`** — glob-scoped rule disables, with
+  `"*"` to skip every rule for a path. Previously the only lever was the global
+  `disable` list, so one noisy rule in one directory cost coverage everywhere.
+
+- **XR000 — stale suppression detection.** Reports a `# xray: disable=` comment
+  that suppressed nothing. Only line-level suppressions are checked;
+  `disable-file=` legitimately guards a file that is currently clean. It found
+  two real stale suppressions in xray's own `clean.py` fixture on first run,
+  left behind by this release's DK004 change.
+
 ### Changed
 
 - **Receiver tracking (`src/bindings.rs`).** xray now records what each name was
@@ -35,11 +98,23 @@ xray uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   value, so the hint previously pointed the wrong way. Inside a loop the warning
   is unchanged — there the iteration itself is the problem.
 
+- **`fix_eligible` no longer over-promises.** XR006 and IO006 advertised a fix
+  that was never implemented. `src/fix.rs` is now the single source of truth and
+  a test pins every `ExplainEntry` to it, so a rule cannot claim a fix nobody
+  wrote.
+
 - **NP003 describes `np.full` correctly.** `np.full(shape, 0)` infers `int64`
   from the fill value; it does not default to `float64` like `zeros`, `ones` and
   `empty`. The message now says so.
 
 ### Packaging
+
+- **Release binaries are stripped.** `[profile.release] strip = true` drops debug
+  symbols from published binaries — roughly 15% smaller to download onto a login
+  node, with no practical loss: a release backtrace was not useful anyway and
+  panics still report their message. `[profile.bench]` opts back out, since it
+  inherits from `release` and stripping would take symbol names out of
+  profiler output.
 
 - **Linux release binaries are now statically linked against musl.**
   `release.yml` builds `x86_64-unknown-linux-musl` and
@@ -94,6 +169,10 @@ xray uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `parsed.path` field, a `.with_fix()` builder and an `ExplainEntry` shape — none
   of which exist. A contributor following them would have failed at every step.
   Rewritten against the real codebase.
+
+- **`xray explain <unknown-id>` printed two different error messages** for one
+  error: `explain()` reported it and `main` reported it again in different words.
+  `main` now just exits 2.
 
 - **`docs/rules/dask.md` documented a rule DK004 does not implement** (it
   described `dask.compute()` with a single argument), and `docs/rules/numpy.md`
@@ -466,7 +545,8 @@ Correctness elsewhere:
 
 ---
 
-[Unreleased]: https://github.com/greensh16/xray/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/greensh16/xray/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/greensh16/xray/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/greensh16/xray/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/greensh16/xray/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/greensh16/xray/compare/v0.8.0...v0.9.0

@@ -14,7 +14,7 @@ or any HPC cluster without loading a Python module.
 Download a pre-built binary from the [releases page](https://github.com/greensh16/xray/releases/latest):
 
 ```bash
-curl -L https://github.com/greensh16/xray/releases/download/v1.0.1/xray-linux-x86_64 \
+curl -L https://github.com/greensh16/xray/releases/download/v1.1.0/xray-linux-x86_64 \
   -o ~/.local/bin/xray && chmod +x ~/.local/bin/xray
 ```
 
@@ -35,6 +35,37 @@ xray explain XR001            # show rationale and fix examples for a rule
 xray init                     # write an annotated xray.toml to the current directory
 ```
 
+### Fixing
+
+```bash
+xray fix src/                 # apply every available auto-fix, printing a diff
+xray fix --dry-run src/       # show the diff without writing anything
+xray src/ --fix               # same as `xray fix src/`
+```
+
+Seven rules carry a mechanical rewrite: XR001, XR008, XR009, DK007, NP004,
+NP006, NP007. `xray rules --format json` reports `fix_eligible` per rule.
+
+Fixes are deliberately narrow — each is an intra-line edit whose result is
+verified to parse. Rules whose "fix" would restructure code (NP002's
+accumulate-in-a-list rewrite) or require a judgement call (XR006's dimension
+name) stay advisory. Original line endings and quote style are preserved, and
+notebooks are never rewritten.
+
+### Diagnosing
+
+```bash
+xray doctor analysis.py       # why did (or didn't) xray fire on this file?
+xray rules                    # the rule table
+xray rules --format json      # machine-readable rule metadata
+```
+
+`xray doctor` prints the resolved import context and which rule domains it
+gates, which `xray.toml` is in effect and where it came from, any matching
+exclusion, and what actually fired. Reach for it when a file reports nothing
+unexpectedly — xray reads only **top-level** imports, so an `import xarray`
+inside a function body silently disables every xarray rule for that file.
+
 Exit codes: `0` nothing at or above `--fail-on` · `1` findings at or above it · `2` fatal error.
 
 `--fail-on` defaults to `error`, so warnings and hints are reported without failing
@@ -45,62 +76,71 @@ to report without ever failing.
 
 ## Rules
 
-33 rules across four domains. All IDs are stable.
+34 rules across four domains plus one cross-domain check. All IDs are stable.
+The **Fix** column marks rules `xray fix` can rewrite mechanically.
 `xray --list-rules` prints this table; `xray explain <ID>` gives the rationale,
 a bad/good example pair, and links to upstream docs.
 
 ### XR — xarray
 
-| ID | Default | Description |
-|----|---------|-------------|
-| XR001 | warning | open_dataset/open_mfdataset called without chunks= — data loads eagerly into memory |
-| XR002 | warning | .values accessed on a DataArray — materialises the full array and drops coordinates |
-| XR003 | hint | for-loop iterating over a Dataset/DataArray attribute — prefer vectorised operations |
-| XR004 | warning | .sel() called with a float literal — use method='nearest' or tolerance= to avoid silent misses |
-| XR005 | error | .compute() called inside a for loop — triggers the full dask graph on every iteration |
-| XR006 | warning | .to_array()/.to_dataarray() called without dim= — creates an unnamed 'variable' concat dimension |
-| XR007 | error | xr.concat called inside a for loop — O(n²) intermediate copies; collect then concat once |
-| XR008 | warning | open_mfdataset called without parallel=True — files are opened serially |
-| XR009 | warning | apply_ufunc with dask='allowed' silently falls back to serial execution; use dask='parallelized' |
-| XR010 | warning | xr.merge called inside a for loop — O(n²) cost; collect datasets then merge once |
-| XR011 | hint | to_netcdf() called without encoding= — data written as float64 with no compression |
+| ID | Default | Fix | Description |
+|----|---------|-----|-------------|
+| XR001 | warning | ✓ | open_dataset/open_mfdataset called without chunks= — data loads eagerly into memory |
+| XR002 | warning |  | .values accessed on a DataArray — materialises the full array and drops coordinates |
+| XR003 | hint |  | for-loop iterating over a Dataset/DataArray attribute — prefer vectorised operations |
+| XR004 | warning |  | .sel() called with a float literal — use method='nearest' or tolerance= to avoid silent misses |
+| XR005 | error |  | .compute() called inside a for loop — triggers the full dask graph on every iteration |
+| XR006 | warning |  | .to_array()/.to_dataarray() called without dim= — creates an unnamed 'variable' concat dimension |
+| XR007 | error |  | xr.concat called inside a for loop — O(n²) intermediate copies; collect then concat once |
+| XR008 | warning | ✓ | open_mfdataset called without parallel=True — files are opened serially |
+| XR009 | warning | ✓ | apply_ufunc with dask='allowed' silently falls back to serial execution; use dask='parallelized' |
+| XR010 | warning |  | xr.merge called inside a for loop — O(n²) cost; collect datasets then merge once |
+| XR011 | hint |  | to_netcdf() called without encoding= — data written as float64 with no compression |
 
 ### DK — Dask
 
-| ID | Default | Description |
-|----|---------|-------------|
-| DK001 | error | .compute() called inside a for loop — rebuilds the full task graph every iteration |
-| DK002 | error | dask.compute() called inside a for loop |
-| DK003 | warning | More .compute() calls in one file than dask.compute_call_threshold — consider .persist() for reused graphs |
-| DK004 | hint | Dask operation immediately followed by .compute() — no lazy benefit, use pandas/numpy directly |
-| DK005 | warning | .persist() result not assigned — cost of materialising the graph is paid with no benefit |
-| DK006 | warning | .persist().compute() chain — persist() is redundant; just call .compute() directly |
-| DK007 | warning | da.from_array() called without chunks= — creates a single-chunk array that defeats dask parallelism |
-| DK008 | warning | .rechunk() called inside a for loop — triggers a full graph materialisation on every iteration |
-| DK009 | error | da.concatenate() inside a for loop — O(n²) intermediate copies; collect arrays then concatenate once |
+| ID | Default | Fix | Description |
+|----|---------|-----|-------------|
+| DK001 | error |  | .compute() called inside a for loop — rebuilds the full task graph every iteration |
+| DK002 | error |  | dask.compute() called inside a for loop |
+| DK003 | warning |  | More .compute() calls in one file than dask.compute_call_threshold — consider .persist() for reused graphs |
+| DK004 | hint |  | Dask object constructed and immediately .compute()d — the graph never did any work, use pandas/numpy directly |
+| DK005 | warning |  | .persist() result not assigned — cost of materialising the graph is paid with no benefit |
+| DK006 | warning |  | .persist().compute() chain — persist() is redundant; just call .compute() directly |
+| DK007 | warning | ✓ | da.from_array() called without chunks= — creates a single-chunk array that defeats dask parallelism |
+| DK008 | warning |  | .rechunk() called inside a for loop — triggers a full graph materialisation on every iteration |
+| DK009 | error |  | da.concatenate() inside a for loop — O(n²) intermediate copies; collect arrays then concatenate once |
 
 ### NP — NumPy / pandas
 
-| ID | Default | Description |
-|----|---------|-------------|
-| NP001 | warning | DataFrame.iterrows() — row-by-row Python iteration, use vectorised operations |
-| NP002 | error | pd.concat / np.concatenate inside a loop — quadratic copy overhead |
-| NP003 | hint | np.zeros/ones/empty called without dtype= — silently defaults to float64 |
-| NP004 | warning | math.* scalar function — replace with numpy ufunc; Warning in loops, Hint elsewhere |
-| NP005 | warning | Chained indexing df[col][row] — creates a copy; assignments silently fail |
-| NP006 | warning | np.matrix() is deprecated since NumPy 1.16 — use np.array() / np.ndarray instead |
-| NP007 | warning | DataFrame.applymap() is deprecated (use .map()), or .apply(lambda) inside a loop |
+| ID | Default | Fix | Description |
+|----|---------|-----|-------------|
+| NP001 | warning |  | DataFrame.iterrows() — row-by-row Python iteration, use vectorised operations |
+| NP002 | error |  | pd.concat / np.concatenate inside a loop — quadratic copy overhead |
+| NP003 | hint |  | np.zeros/ones/empty called without dtype= — silently defaults to float64 |
+| NP004 | warning | ✓ | math.* scalar function — replace with numpy ufunc; Warning in loops, Hint elsewhere |
+| NP005 | warning |  | Chained indexing df[col][row] — creates a copy; assignments silently fail |
+| NP006 | warning | ✓ | np.matrix() is deprecated since NumPy 1.16 — use np.array() / np.ndarray instead |
+| NP007 | warning | ✓ | DataFrame.applymap() is deprecated (use .map()), or .apply(lambda) inside a loop |
 
 ### IO — Scientific I/O
 
-| ID | Default | Description |
-|----|---------|-------------|
-| IO001 | hint | np.save() used — uncompressed, unchunked; prefer Zarr or HDF5 for large arrays |
-| IO002 | hint | netCDF4.Dataset opened directly — bypasses xarray coordinate alignment machinery |
-| IO003 | warning | zarr.open called without chunks= — unchunked Zarr defeats compression and parallel I/O |
-| IO004 | warning | netCDF4 variable subscripted inside a loop — each read may hit disk; pre-load outside the loop |
-| IO005 | hint | h5py.File opened without swmr=True — consider SWMR mode for concurrent HPC read workflows |
-| IO006 | warning | xr.open_dataset called with engine='scipy' — loads eagerly without chunking; use 'netcdf4' or 'zarr' |
+| ID | Default | Fix | Description |
+|----|---------|-----|-------------|
+| IO001 | hint |  | np.save() used — uncompressed, unchunked; prefer Zarr or HDF5 for large arrays |
+| IO002 | hint |  | netCDF4.Dataset opened directly — bypasses xarray coordinate alignment machinery |
+| IO003 | warning |  | zarr.open called without chunks= — unchunked Zarr defeats compression and parallel I/O |
+| IO004 | warning |  | netCDF4 variable subscripted inside a loop — each read may hit disk; pre-load outside the loop |
+| IO005 | hint |  | h5py.File opened without swmr=True — consider SWMR mode for concurrent HPC read workflows |
+| IO006 | warning |  | xr.open_dataset called with engine='scipy' — loads eagerly without chunking; use 'netcdf4' or 'zarr' |
+
+### Cross-domain
+
+| ID | Default | Fix | Description |
+|----|---------|-----|-------------|
+| XR000 | hint |  | A `# xray: disable=` comment that suppressed nothing — the rule no longer fires here |
+
+---
 
 ## Configuration
 
@@ -145,7 +185,7 @@ Environment variables: `XRAY_CONFIG`, `XRAY_FORMAT`, `XRAY_MIN_SEVERITY`, `XRAY_
 
 Full documentation lives on the [GitHub Wiki](https://github.com/greensh16/xray/wiki):
 
-- [Rule reference](https://github.com/greensh16/xray/wiki/Rule-Reference) — rationale, examples, and fix hints for all 33 rules
+- [Rule reference](https://github.com/greensh16/xray/wiki/Rule-Reference) — rationale, examples, and fix hints for all 34 rules
 - [Configuration guide](https://github.com/greensh16/xray/wiki/Configuration) — full `xray.toml` schema
 - [JSON output schema](https://github.com/greensh16/xray/wiki/JSON-Output-Schema) — stable v1 field reference
 - [HPC deployment cookbook](https://github.com/greensh16/xray/wiki/HPC-Deployment-Cookbook) — Gadi, Setonix, PBS, Slurm

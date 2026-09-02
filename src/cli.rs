@@ -67,6 +67,16 @@ pub struct Cli {
     #[arg(long, value_name = "REF")]
     pub diff: Option<String>,
 
+    /// Apply available auto-fixes instead of only reporting them
+    ///
+    /// Equivalent to `xray fix <paths>`.  Prints a diff of every change.
+    #[arg(long)]
+    pub fix: bool,
+
+    /// With --fix or `xray fix`, show the diff without writing anything
+    #[arg(long)]
+    pub dry_run: bool,
+
     /// Watch for file changes and re-lint automatically
     ///
     /// Performs an initial lint of all matching files, then watches for saves
@@ -103,6 +113,53 @@ pub enum XrayCommand {
     /// back to the editor in real time.
     Lsp,
 
+    /// Rewrite files in place, applying every available auto-fix
+    ///
+    /// Prints a unified diff of each change.  Only rules with a verifiable
+    /// mechanical rewrite are fixed; the rest stay advisory.  Notebooks are
+    /// never rewritten.
+    ///
+    /// Examples:
+    ///   xray fix src/
+    ///   xray fix --dry-run src/
+    Fix {
+        /// Files or globs to fix (default: the same set `xray` would lint)
+        #[arg(num_args = 0..)]
+        paths: Vec<String>,
+
+        /// Show the diff without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// List rules as a table or as machine-readable JSON
+    ///
+    /// The JSON form is the source of truth for generated documentation:
+    /// every rule's id, name, domain, severity, description, docs URL and
+    /// auto-fix eligibility.
+    ///
+    /// Examples:
+    ///   xray rules
+    ///   xray rules --format json
+    Rules {
+        /// Output format
+        #[arg(long, short = 'f', default_value = "text")]
+        format: RuleListFormat,
+    },
+
+    /// Explain why xray did or did not fire on a file
+    ///
+    /// Prints the resolved import context and which rule domains it gates,
+    /// the config that was selected and where it came from, and whether the
+    /// path is excluded.  Use this when a file reports nothing unexpectedly.
+    ///
+    /// Examples:
+    ///   xray doctor analysis.py
+    Doctor {
+        /// File to diagnose
+        path: String,
+    },
+
     /// Print shell completion script to stdout
     ///
     /// Usage examples:
@@ -113,6 +170,15 @@ pub enum XrayCommand {
         /// Target shell
         shell: Shell,
     },
+}
+
+/// Output format for `xray rules`.
+#[derive(ValueEnum, Clone, Debug, PartialEq)]
+pub enum RuleListFormat {
+    /// Aligned table, as `--list-rules` prints
+    Text,
+    /// JSON array of rule metadata objects
+    Json,
 }
 
 /// Output format for diagnostics.

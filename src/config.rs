@@ -23,6 +23,28 @@ pub struct Config {
     #[serde(default)]
     pub min_severity: Option<MinSeverity>,
 
+    /// Inherit another config file, whose keys this one overrides.
+    ///
+    /// Resolved relative to the directory of the config that declares it, so a
+    /// facility can publish a house profile that project configs extend:
+    /// `extends = "../shared/nci.toml"`.
+    ///
+    /// Local paths only. A remote URL would make every lint run depend on the
+    /// network, turn a CI failure into a fetch failure, and give whoever
+    /// controls that URL the ability to change what your CI enforces — so
+    /// vendor the file and point at it instead.
+    #[serde(default)]
+    pub extends: Option<String>,
+
+    /// Rules to skip for paths matching a glob.
+    ///
+    /// `"tests/**" = ["*"]` disables every rule under `tests/`; naming
+    /// specific IDs disables only those. Without this the only lever is the
+    /// global `disable` list, so one noisy rule in one directory costs
+    /// coverage everywhere.
+    #[serde(default)]
+    pub per_file_ignores: HashMap<String, Vec<String>>,
+
     /// Default file include/exclude globs (used when no paths are given on the CLI).
     #[serde(default)]
     pub paths: PathsConfig,
@@ -53,6 +75,14 @@ pub struct PathsConfig {
     /// Glob patterns to exclude.  Applied after `include`.
     #[serde(default)]
     pub exclude: Vec<String>,
+}
+
+impl PathsConfig {
+    /// True when nothing was set explicitly — used by `extends` to decide
+    /// whether the child overrode the parent's path globs or just left them.
+    pub fn is_default(&self) -> bool {
+        self.include == default_include_globs() && self.exclude.is_empty()
+    }
 }
 
 impl Default for PathsConfig {
@@ -139,12 +169,82 @@ fn default_true() -> bool {
 
 impl Config {
     pub fn from_file(path: &Path) -> Result<Self> {
+        Self::from_file_inner(path, &mut Vec::new())
+    }
+
+    /// `seen` carries the inheritance chain so a cycle is reported rather than
+    /// recursed into until the stack runs out.
+    fn from_file_inner(path: &Path, seen: &mut Vec<std::path::PathBuf>) -> Result<Self> {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if seen.contains(&canonical) {
+            let chain: Vec<String> = seen
+                .iter()
+                .map(|p| p.display().to_string())
+                .chain(std::iter::once(canonical.display().to_string()))
+                .collect();
+            anyhow::bail!("`extends` cycle in config: {}", chain.join(" → "));
+        }
+        seen.push(canonical);
+
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("Cannot read config: {}", path.display()))?;
         let mut cfg: Self = toml::from_str(&raw)
             .with_context(|| format!("Cannot parse config: {}", path.display()))?;
+
+        if let Some(ref parent_ref) = cfg.extends.clone() {
+            let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+            let parent_path = base_dir.join(parent_ref);
+            let parent = Self::from_file_inner(&parent_path, seen).with_context(|| {
+                format!(
+                    "while resolving `extends = \"{parent_ref}\"` from {}",
+                    path.display()
+                )
+            })?;
+            cfg.inherit_from(parent);
+        }
+
         cfg.normalise();
         Ok(cfg)
+    }
+
+    /// Merge `parent` underneath `self`: anything this file did not set is
+    /// taken from the parent, and collections are unioned rather than replaced,
+    /// so extending a profile never silently drops its rules.
+    fn inherit_from(&mut self, parent: Self) {
+        for id in parent.disable {
+            self.disable.insert(id);
+        }
+        for (id, sev) in parent.severity_overrides {
+            self.severity_overrides.entry(id).or_insert(sev);
+        }
+        for (glob, ids) in parent.per_file_ignores {
+            self.per_file_ignores.entry(glob).or_insert(ids);
+        }
+        if self.min_severity.is_none() {
+            self.min_severity = parent.min_severity;
+        }
+        if self.paths.is_default() {
+            self.paths = parent.paths;
+        }
+    }
+
+    /// Rules disabled for `path` by `[per_file_ignores]`.
+    ///
+    /// `"*"` in the list disables every rule for matching paths.
+    pub fn ignores_for_path(&self, path: &str) -> HashSet<String> {
+        let p = Path::new(path);
+        let mut out = HashSet::new();
+        for (pattern, ids) in &self.per_file_ignores {
+            let Ok(g) = glob::Pattern::new(pattern) else {
+                continue;
+            };
+            if g.matches_path(p) || g.matches(path) {
+                for id in ids {
+                    out.insert(id.to_uppercase());
+                }
+            }
+        }
+        out
     }
 
     /// Upper-case every rule ID so that `disable = ["xr001"]` behaves the same
@@ -158,21 +258,38 @@ impl Config {
             .drain()
             .map(|(id, sev)| (id.to_uppercase(), sev.to_lowercase()))
             .collect();
+        self.per_file_ignores = self
+            .per_file_ignores
+            .drain()
+            .map(|(glob, ids)| (glob, ids.iter().map(|i| i.to_uppercase()).collect()))
+            .collect();
     }
 
     /// Walk up directories looking for xray.toml.
     pub fn from_dir(start: &str) -> Result<Self> {
-        let mut dir = std::fs::canonicalize(start)?;
+        match Self::find_config_file(start) {
+            Some(path) => Self::from_file(&path),
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// The `xray.toml` that [`Config::from_dir`] would load, if any.
+    ///
+    /// Exposed so `xray doctor` can report *which* config is in effect —
+    /// "walks up from the current directory" is not an answer a user can act
+    /// on when the wrong file is being picked up.
+    pub fn find_config_file(start: &str) -> Option<std::path::PathBuf> {
+        let mut dir = std::fs::canonicalize(start).ok()?;
         loop {
             let candidate = dir.join("xray.toml");
             if candidate.exists() {
-                return Self::from_file(&candidate);
+                return Some(candidate);
             }
             if !dir.pop() {
                 break;
             }
         }
-        Ok(Self::default())
+        None
     }
 
     pub fn is_disabled(&self, rule_id: &str) -> bool {

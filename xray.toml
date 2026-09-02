@@ -12,6 +12,25 @@
 # min_severity = "hint"
 
 
+# ── Inherit a shared config ────────────────────────────────────────────────────
+# Keys set here override the inherited ones; `disable`, `severity_overrides`
+# and `per_file_ignores` are merged rather than replaced, so extending a
+# profile never silently drops its rules.
+# Resolved relative to THIS file's directory.  Local paths only — a remote URL
+# would make every lint run depend on the network and let whoever controls that
+# URL change what your CI enforces.  Vendor the file and point at it instead.
+# extends = "../shared/house-style.toml"
+
+
+# ── Per-path rule control ──────────────────────────────────────────────────────
+# Skip rules for paths matching a glob.  Use "*" to skip every rule.
+# Without this the only lever is the global `disable` list above, so one noisy
+# rule in one directory costs coverage across the whole project.
+# [per_file_ignores]
+# "**/tests/**" = ["*"]
+# "notebooks/**" = ["DK004", "NP004"]
+
+
 # ── Per-rule severity overrides ────────────────────────────────────────────────
 # Override the default severity for individual rules.
 # Valid values: "hint" | "warning" | "error"
