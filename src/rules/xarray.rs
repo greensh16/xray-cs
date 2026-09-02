@@ -1,11 +1,14 @@
+use std::sync::LazyLock;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Query, QueryCursor};
 
 use crate::{
     config::Config,
     diagnostic::{Diagnostic, RuleMeta, Severity},
+    parser,
     parser::{
-        ParsedFile, has_keyword_arg, is_inside_for_loop, keyword_arg_value, node_text, position,
+        ParsedFile, call_is_from, has_keyword_arg, is_inside_loop, keyword_arg_present_or_unknown,
+        keyword_arg_value, node_text, position,
     },
 };
 
@@ -14,6 +17,46 @@ use super::RuleSet;
 pub struct XarrayRules;
 
 const QUERY_SRC: &str = include_str!("../../queries/xarray.scm");
+
+/// Attribute names XR003 treats as a Dataset/DataArray dimension.
+///
+/// The rule used to fire for *any* attribute iterated in a `for` loop, so
+/// ordinary code like `for f in self.files:` was reported as a dimension loop.
+/// Restricting to a dimension vocabulary keeps the true positives (`for t in
+/// ds.time:`) and drops the noise.
+const DIMENSION_NAMES: &[&str] = &[
+    "time",
+    "lat",
+    "latitude",
+    "lon",
+    "longitude",
+    "level",
+    "lev",
+    "depth",
+    "height",
+    "plev",
+    "x",
+    "y",
+    "z",
+    "member",
+    "ensemble",
+    "realization",
+    "band",
+    "channel",
+    "dims",
+    "coords",
+    "variables",
+    "data_vars",
+    "indexes",
+];
+
+/// Compiled once per process and shared across all rayon workers.
+/// `Query` is `Send + Sync`; only the `QueryCursor` needs to be per-call.
+/// A compilation failure is a bug in xray itself, so we fail loudly.
+static QUERY: LazyLock<Query> = LazyLock::new(|| {
+    Query::new(&tree_sitter_python::LANGUAGE.into(), QUERY_SRC)
+        .unwrap_or_else(|e| panic!("xray: BUG — failed to compile xarray query: {e}"))
+});
 
 impl RuleSet for XarrayRules {
     fn meta() -> Vec<RuleMeta> {
@@ -90,16 +133,17 @@ impl RuleSet for XarrayRules {
     fn check(file: &ParsedFile, path: &str, config: &Config) -> Vec<Diagnostic> {
         let mut diags = Vec::new();
         let source = file.source.as_bytes();
-        let lang = tree_sitter_python::LANGUAGE.into();
-
-        // Query compilation errors are a bug in xray itself — fail loudly.
-        let query = Query::new(&lang, QUERY_SRC)
-            .unwrap_or_else(|e| panic!("xray: BUG — failed to compile xarray query: {e}"));
+        let query = &*QUERY;
 
         let mut cursor = QueryCursor::new();
         let root = file.tree.root_node();
 
-        let mut matches = cursor.matches(&query, root, source);
+        // `.sel(lat=-33.5, lon=150.2)` matches the XR004 pattern once per float
+        // argument; the diagnostic is about the call, so report it once.
+        let mut reported_sel_calls: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+
+        let mut matches = cursor.matches(query, root, source);
         while let Some(m) = matches.next() {
             let pattern = m.pattern_index;
             // Patterns are 0-indexed in the order they appear in the .scm file
@@ -110,7 +154,7 @@ impl RuleSet for XarrayRules {
                         .capture_index_for_name("xr_open_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        if has_keyword_arg(call_node, source, "chunks") {
+                        if keyword_arg_present_or_unknown(call_node, source, "chunks") {
                             continue;
                         }
                         let (line, col) = position(&call_node);
@@ -156,7 +200,7 @@ impl RuleSet for XarrayRules {
                             .parent()
                             .filter(|p| p.kind() == "call")
                             .and_then(|p| p.child_by_field_name("function"))
-                            .map(|f| f.start_byte() == node.start_byte())
+                            .map(|f| f.id() == node.id())
                             .unwrap_or(false);
 
                         if !is_method_call {
@@ -188,12 +232,15 @@ impl RuleSet for XarrayRules {
                         .capture_index_for_name("xr_loop_iter")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        let (line, col) = position(&iter_node);
                         let dim = query
                             .capture_index_for_name("xr_loop_dim")
                             .and_then(|i| m.nodes_for_capture_index(i).next())
                             .map(|n| node_text(&n, source))
                             .unwrap_or("dimension");
+                        if !DIMENSION_NAMES.contains(&dim) {
+                            continue;
+                        }
+                        let (line, col) = position(&iter_node);
                         diags.push(
                             Diagnostic::new(
                                 "XR003",
@@ -203,7 +250,9 @@ impl RuleSet for XarrayRules {
                                 col,
                                 format!("Iterating over `.{dim}` in a Python loop — consider `.map()`, `.apply_ufunc()`, or vectorised indexing"),
                             )
-                            .with_suggestion("Use `ds.isel({dim}=slice(...))` or `xr.apply_ufunc` for vectorised operations")
+                            .with_suggestion(format!(
+                                "Use `ds.isel({dim}=slice(...))` or `xr.apply_ufunc` for vectorised operations"
+                            ))
                             .with_url("https://docs.xarray.dev/en/stable/user-guide/computation.html"),
                         );
                     }
@@ -218,7 +267,11 @@ impl RuleSet for XarrayRules {
                         // Suppress when method= or tolerance= is provided
                         if has_keyword_arg(node, source, "method")
                             || has_keyword_arg(node, source, "tolerance")
+                            || parser::has_dictionary_splat(node)
                         {
+                            continue;
+                        }
+                        if !reported_sel_calls.insert(node.id()) {
                             continue;
                         }
                         let (line, col) = position(&node);
@@ -243,7 +296,7 @@ impl RuleSet for XarrayRules {
                         .capture_index_for_name("xr_compute_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        if !is_inside_for_loop(node) {
+                        if !is_inside_loop(node) {
                             continue;
                         }
                         let (line, col) = position(&node);
@@ -268,7 +321,7 @@ impl RuleSet for XarrayRules {
                         .capture_index_for_name("xr_to_array_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        if has_keyword_arg(call_node, source, "dim") {
+                        if keyword_arg_present_or_unknown(call_node, source, "dim") {
                             continue;
                         }
                         let (line, col) = position(&call_node);
@@ -299,7 +352,12 @@ impl RuleSet for XarrayRules {
                         .capture_index_for_name("xr_concat_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        if !is_inside_for_loop(node) {
+                        // `pd.concat(...)` and `df.concat(...)` are not xarray;
+                        // NP002 owns the pandas/numpy case.
+                        if !call_is_from(node, source, &file.imports, "xarray") {
+                            continue;
+                        }
+                        if !is_inside_loop(node) {
                             continue;
                         }
                         let (line, col) = position(&node);
@@ -341,7 +399,7 @@ impl RuleSet for XarrayRules {
                         // Check that parallel= is absent or not True
                         let parallel_val = keyword_arg_value(call_node, source, "parallel");
                         let already_parallel = parallel_val.map(|v| v == "True").unwrap_or(false);
-                        if already_parallel {
+                        if already_parallel || parser::has_dictionary_splat(call_node) {
                             continue;
                         }
                         let (line, col) = position(&call_node);
@@ -401,7 +459,11 @@ impl RuleSet for XarrayRules {
                         .capture_index_for_name("xr_merge_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        if !is_inside_for_loop(node) {
+                        // `pd.merge(...)` / `df.merge(...)` are pandas, not xarray.
+                        if !call_is_from(node, source, &file.imports, "xarray") {
+                            continue;
+                        }
+                        if !is_inside_loop(node) {
                             continue;
                         }
                         let (line, col) = position(&node);
@@ -426,7 +488,7 @@ impl RuleSet for XarrayRules {
                         .capture_index_for_name("xr_to_netcdf_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        if has_keyword_arg(call_node, source, "encoding") {
+                        if keyword_arg_present_or_unknown(call_node, source, "encoding") {
                             continue;
                         }
                         let (line, col) = position(&call_node);

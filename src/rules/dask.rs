@@ -1,10 +1,11 @@
+use std::sync::LazyLock;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Query, QueryCursor};
 
 use crate::{
     config::Config,
     diagnostic::{Diagnostic, RuleMeta, Severity},
-    parser::{ParsedFile, has_keyword_arg, is_inside_for_loop, node_text, position},
+    parser::{ParsedFile, call_is_from, is_inside_loop, keyword_arg_present_or_unknown, position},
 };
 
 use super::RuleSet;
@@ -12,6 +13,14 @@ use super::RuleSet;
 pub struct DaskRules;
 
 const QUERY_SRC: &str = include_str!("../../queries/dask.scm");
+
+/// Compiled once per process and shared across all rayon workers.
+/// `Query` is `Send + Sync`; only the `QueryCursor` needs to be per-call.
+/// A compilation failure is a bug in xray itself, so we fail loudly.
+static QUERY: LazyLock<Query> = LazyLock::new(|| {
+    Query::new(&tree_sitter_python::LANGUAGE.into(), QUERY_SRC)
+        .unwrap_or_else(|e| panic!("xray: BUG — failed to compile dask query: {e}"))
+});
 
 impl RuleSet for DaskRules {
     fn meta() -> Vec<RuleMeta> {
@@ -32,7 +41,7 @@ impl RuleSet for DaskRules {
                 id: "DK003",
                 name: "excessive-compute-calls",
                 severity: Severity::Warning,
-                description: "Multiple .compute() calls in the same scope — consider .persist() for reused graphs",
+                description: "More .compute() calls in one file than dask.compute_call_threshold — consider .persist() for reused graphs",
             },
             RuleMeta {
                 id: "DK004",
@@ -76,11 +85,7 @@ impl RuleSet for DaskRules {
     fn check(file: &ParsedFile, path: &str, config: &Config) -> Vec<Diagnostic> {
         let mut diags = Vec::new();
         let source = file.source.as_bytes();
-        let lang = tree_sitter_python::LANGUAGE.into();
-
-        // Query compilation errors are a bug in xray itself — fail loudly.
-        let query = Query::new(&lang, QUERY_SRC)
-            .unwrap_or_else(|e| panic!("xray: BUG — failed to compile dask query: {e}"));
+        let query = &*QUERY;
 
         let mut cursor = QueryCursor::new();
         let root = file.tree.root_node();
@@ -89,7 +94,7 @@ impl RuleSet for DaskRules {
         let mut compute_call_count = 0usize;
         let mut compute_call_positions = Vec::new();
 
-        let mut matches = cursor.matches(&query, root, source);
+        let mut matches = cursor.matches(query, root, source);
         while let Some(m) = matches.next() {
             match m.pattern_index {
                 // DK001 — .compute() in for loop
@@ -98,7 +103,7 @@ impl RuleSet for DaskRules {
                         .capture_index_for_name("dk_compute_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        if !is_inside_for_loop(node) {
+                        if !is_inside_loop(node) {
                             continue;
                         }
                         let (line, col) = position(&node);
@@ -123,7 +128,7 @@ impl RuleSet for DaskRules {
                         .capture_index_for_name("dk_dask_compute_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        if !is_inside_for_loop(node) {
+                        if !is_inside_loop(node) {
                             continue;
                         }
                         let (line, col) = position(&node);
@@ -225,38 +230,13 @@ impl RuleSet for DaskRules {
                         .capture_index_for_name("dk_from_array_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        // Belt-and-suspenders: verify the function is literally `from_array`
-                        // (tree-sitter 0.26 may not filter #eq? predicates inside [...]
-                        // alternatives for all structural matches).
-                        let fn_attr_name = call_node
-                            .child_by_field_name("function")
-                            .and_then(|f| {
-                                if f.kind() == "attribute" {
-                                    f.child_by_field_name("attribute")
-                                } else {
-                                    Some(f) // bare identifier
-                                }
-                            })
-                            .map(|n| node_text(&n, source))
-                            .unwrap_or("");
-                        if fn_attr_name != "from_array" {
+                        // Only fire for dask's from_array, resolved through the
+                        // file's import aliases — the old hard-coded `da`/`dask`
+                        // receiver check missed `import dask.array as dsa`.
+                        if !call_is_from(call_node, source, &file.imports, "dask") {
                             continue;
                         }
-                        // Only fire for da.from_array / dask.from_array — not arbitrary .from_array()
-                        if let Some(func) = call_node.child_by_field_name("function") {
-                            if func.kind() == "attribute" {
-                                if let Some(obj) = func.child_by_field_name("object") {
-                                    let obj_name = node_text(&obj, source);
-                                    if !matches!(obj_name, "da" | "dask") {
-                                        continue;
-                                    }
-                                } else {
-                                    continue;
-                                }
-                            }
-                        }
-                        // bare from_array(...) — allow only if dask.array is imported
-                        if !has_keyword_arg(call_node, source, "chunks") {
+                        if !keyword_arg_present_or_unknown(call_node, source, "chunks") {
                             let (line, col) = position(&call_node);
                             diags.push(
                                 Diagnostic::new(
@@ -281,7 +261,7 @@ impl RuleSet for DaskRules {
                         .capture_index_for_name("dk_rechunk_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        if !is_inside_for_loop(node) {
+                        if !is_inside_loop(node) {
                             continue;
                         }
                         let (line, col) = position(&node);
@@ -306,19 +286,13 @@ impl RuleSet for DaskRules {
                         .capture_index_for_name("dk_concatenate_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        if !is_inside_for_loop(node) {
+                        if !is_inside_loop(node) {
                             continue;
                         }
-                        // Only fire for da.concatenate / dask.concatenate — not xr.concat etc.
-                        if let Some(func) = node.child_by_field_name("function") {
-                            if func.kind() == "attribute" {
-                                if let Some(obj) = func.child_by_field_name("object") {
-                                    let obj_name = node_text(&obj, source);
-                                    if !matches!(obj_name, "da" | "dask") {
-                                        continue;
-                                    }
-                                }
-                            }
+                        // Only fire for dask's concatenate — not np.concatenate
+                        // (NP002) or xr.concat (XR007).
+                        if !call_is_from(node, source, &file.imports, "dask") {
+                            continue;
                         }
                         let (line, col) = position(&node);
                         diags.push(
@@ -340,12 +314,14 @@ impl RuleSet for DaskRules {
             }
         }
 
-        // DK003 — fire if compute count exceeds threshold
-        if !config.is_disabled("DK003") && compute_call_count >= config.dask.compute_call_threshold
-        {
-            // Report on the first excess call
+        // DK003 — fire once the file has more computes than the threshold
+        // allows.  Both xray.toml and `xray init` describe the threshold as the
+        // number of calls tolerated *before* the rule fires, so the comparison
+        // is strictly greater-than.
+        if !config.is_disabled("DK003") && compute_call_count > config.dask.compute_call_threshold {
+            // Report on the first call past the threshold
             if let Some(&(line, col)) =
-                compute_call_positions.get(config.dask.compute_call_threshold - 1)
+                compute_call_positions.get(config.dask.compute_call_threshold)
             {
                 diags.push(
                     Diagnostic::new(

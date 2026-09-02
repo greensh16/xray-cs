@@ -780,7 +780,10 @@ fn sarif_output_has_correct_schema_and_version() {
 
     // We build the SARIF from the actual fixture results via the public fn
     let results = xray::diagnostic::RunResults {
-        files: vec![xray::diagnostic::FileResults { diagnostics: diags }],
+        files: vec![xray::diagnostic::FileResults {
+            path: "tests/fixtures/xarray_bad.py".to_string(),
+            diagnostics: diags,
+        }],
         paths: vec!["tests/fixtures/xarray_bad.py".to_string()],
     };
 
@@ -832,7 +835,10 @@ fn sarif_severity_mapping() {
     assert!(!xr001.is_empty());
 
     let results = xray::diagnostic::RunResults {
-        files: vec![xray::diagnostic::FileResults { diagnostics: xr001 }],
+        files: vec![xray::diagnostic::FileResults {
+            path: "tests/fixtures/xarray_bad.py".to_string(),
+            diagnostics: xr001,
+        }],
         paths: vec!["tests/fixtures/xarray_bad.py".to_string()],
     };
     let sarif_str = build_sarif_json(&results).unwrap();
@@ -849,7 +855,10 @@ fn gitlab_output_is_valid_json_array() {
     assert!(!diags.is_empty());
 
     let results = xray::diagnostic::RunResults {
-        files: vec![xray::diagnostic::FileResults { diagnostics: diags }],
+        files: vec![xray::diagnostic::FileResults {
+            path: "tests/fixtures/xarray_bad.py".to_string(),
+            diagnostics: diags,
+        }],
         paths: vec!["tests/fixtures/xarray_bad.py".to_string()],
     };
 
@@ -878,7 +887,10 @@ fn gitlab_output_is_valid_json_array() {
 fn gitlab_check_name_prefixed_with_xray() {
     let diags = check_fixture("xarray_bad.py");
     let results = xray::diagnostic::RunResults {
-        files: vec![xray::diagnostic::FileResults { diagnostics: diags }],
+        files: vec![xray::diagnostic::FileResults {
+            path: "tests/fixtures/xarray_bad.py".to_string(),
+            diagnostics: diags,
+        }],
         paths: vec!["tests/fixtures/xarray_bad.py".to_string()],
     };
     let json_str = build_gitlab_json(&results).unwrap();
@@ -896,7 +908,10 @@ fn gitlab_check_name_prefixed_with_xray() {
 fn gitlab_fingerprints_are_unique_per_diagnostic() {
     let diags = check_fixture("xarray_bad.py");
     let results = xray::diagnostic::RunResults {
-        files: vec![xray::diagnostic::FileResults { diagnostics: diags }],
+        files: vec![xray::diagnostic::FileResults {
+            path: "tests/fixtures/xarray_bad.py".to_string(),
+            diagnostics: diags,
+        }],
         paths: vec!["tests/fixtures/xarray_bad.py".to_string()],
     };
     let json_str = build_gitlab_json(&results).unwrap();
@@ -922,7 +937,10 @@ fn gitlab_severity_mapping_warning_to_major() {
     let xr001: Vec<_> = diags.into_iter().filter(|d| d.rule_id == "XR001").collect();
     assert!(!xr001.is_empty());
     let results = xray::diagnostic::RunResults {
-        files: vec![xray::diagnostic::FileResults { diagnostics: xr001 }],
+        files: vec![xray::diagnostic::FileResults {
+            path: "tests/fixtures/xarray_bad.py".to_string(),
+            diagnostics: xr001,
+        }],
         paths: vec!["tests/fixtures/xarray_bad.py".to_string()],
     };
     let json_str = build_gitlab_json(&results).unwrap();
@@ -1044,7 +1062,10 @@ fn io004_diagnostic_has_url() {
 fn json_output_has_schema_version_field() {
     let diags = check_fixture("xarray_bad.py");
     let results = xray::diagnostic::RunResults {
-        files: vec![xray::diagnostic::FileResults { diagnostics: diags }],
+        files: vec![xray::diagnostic::FileResults {
+            path: "tests/fixtures/xarray_bad.py".to_string(),
+            diagnostics: diags,
+        }],
         paths: vec!["tests/fixtures/xarray_bad.py".to_string()],
     };
     let json_str = build_json(&results).expect("build_json should succeed");
@@ -1066,7 +1087,10 @@ fn json_output_has_schema_version_field() {
 fn json_output_has_diagnostics_array() {
     let diags = check_fixture("xarray_bad.py");
     let results = xray::diagnostic::RunResults {
-        files: vec![xray::diagnostic::FileResults { diagnostics: diags }],
+        files: vec![xray::diagnostic::FileResults {
+            path: "tests/fixtures/xarray_bad.py".to_string(),
+            diagnostics: diags,
+        }],
         paths: vec!["tests/fixtures/xarray_bad.py".to_string()],
     };
     let json_str = build_json(&results).unwrap();
@@ -1087,7 +1111,10 @@ fn json_output_has_summary_object() {
     let diags = check_fixture("xarray_bad.py");
     let n = diags.len();
     let results = xray::diagnostic::RunResults {
-        files: vec![xray::diagnostic::FileResults { diagnostics: diags }],
+        files: vec![xray::diagnostic::FileResults {
+            path: "tests/fixtures/xarray_bad.py".to_string(),
+            diagnostics: diags,
+        }],
         paths: vec!["tests/fixtures/xarray_bad.py".to_string()],
     };
     let json_str = build_json(&results).unwrap();
@@ -1354,7 +1381,7 @@ fn config_conflict_cli_disable_overrides_toml() {
         ["XR001".to_string()].into_iter().collect();
     let after: Vec<_> = all_diags
         .into_iter()
-        .filter(|d| !cli_disable.contains(&d.rule_id.to_string()))
+        .filter(|d| !cli_disable.iter().any(|id| id == d.rule_id))
         .collect();
     assert!(
         after.iter().all(|d| d.rule_id != "XR001"),
@@ -1395,7 +1422,7 @@ fn collect_paths_direct_file_path_works() {
     // Passing a literal file path (not a glob) must return exactly that file.
     use xray::runner::collect_paths_pub;
     let path = "tests/fixtures/clean.py".to_string();
-    let result = collect_paths_pub(&[path.clone()]).unwrap();
+    let result = collect_paths_pub(std::slice::from_ref(&path)).unwrap();
     assert!(
         result.contains(&path),
         "literal file path must be included as-is"
@@ -1611,4 +1638,140 @@ fn dk009_concatenate_outside_loop_ok() {
         dk009.is_empty(),
         "DK009 must not fire for concatenate outside a loop"
     );
+}
+
+// ── regression: false positives that used to fire ─────────────────────────────
+//
+// Every construct in `false_positives.py` is legitimate code that an earlier
+// version of xray reported.  The fixture must stay completely silent.
+
+#[test]
+fn false_positive_fixture_is_silent() {
+    let diags = check_fixture("false_positives.py");
+    assert!(
+        diags.is_empty(),
+        "false_positives.py must produce zero diagnostics, got: {:#?}",
+        diags
+            .iter()
+            .map(|d| format!("{}:{} [{}] {}", d.file, d.line, d.rule_id, d.message))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn xr003_ignores_non_dimension_attributes() {
+    // `for f in self.files:` is not a dimension loop.
+    let diags = check_fixture("false_positives.py");
+    assert!(diags.iter().all(|d| d.rule_id != "XR003"));
+}
+
+#[test]
+fn xr007_and_xr010_ignore_pandas_receivers() {
+    let diags = check_fixture("false_positives.py");
+    assert!(
+        diags
+            .iter()
+            .all(|d| d.rule_id != "XR007" && d.rule_id != "XR010"),
+        "pandas concat/merge must not be attributed to xarray"
+    );
+}
+
+#[test]
+fn io003_ignores_builtin_open() {
+    let diags = check_fixture("false_positives.py");
+    assert!(diags.iter().all(|d| d.rule_id != "IO003"));
+}
+
+#[test]
+fn io004_ignores_plain_list_and_dict_indexing() {
+    let diags = check_fixture("false_positives.py");
+    assert!(diags.iter().all(|d| d.rule_id != "IO004"));
+}
+
+#[test]
+fn np005_ignores_nested_list_indexing() {
+    let diags = check_fixture("false_positives.py");
+    assert!(diags.iter().all(|d| d.rule_id != "NP005"));
+}
+
+#[test]
+fn missing_keyword_rules_respect_kwargs_splat() {
+    // `xr.open_dataset(path, **OPTS)` may well set chunks=; xray cannot know.
+    let diags = check_fixture("false_positives.py");
+    assert!(
+        diags
+            .iter()
+            .all(|d| d.rule_id != "XR001" && d.rule_id != "DK007"),
+        "rules must not claim a keyword is missing when **kwargs is forwarded"
+    );
+}
+
+// ── regression: loop contexts that used to be missed ─────────────────────────
+
+#[test]
+fn compute_in_comprehension_is_flagged() {
+    let diags = check_fixture("loop_context.py");
+    assert!(
+        diags.iter().any(|d| d.rule_id == "DK001" && d.line == 11),
+        "`[x.compute() for x in items]` should be flagged, got: {:?}",
+        diags
+            .iter()
+            .map(|d| (d.rule_id, d.line))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn compute_in_while_loop_is_flagged() {
+    let diags = check_fixture("loop_context.py");
+    assert!(
+        diags.iter().any(|d| d.rule_id == "DK001" && d.line == 18),
+        "`.compute()` inside a while loop should be flagged"
+    );
+}
+
+#[test]
+fn compute_in_loop_header_is_not_flagged() {
+    // The iterable of a `for` statement is evaluated once, not per iteration.
+    let diags = check_fixture("loop_context.py");
+    assert!(
+        diags
+            .iter()
+            .all(|d| !(d.line == 25 && (d.rule_id == "DK001" || d.rule_id == "XR005"))),
+        "a compute in the loop header runs once and must not be reported"
+    );
+}
+
+#[test]
+fn xr004_matches_negative_float_coordinates() {
+    let diags = check_fixture("loop_context.py");
+    assert!(
+        diags.iter().any(|d| d.rule_id == "XR004"),
+        "`.sel(lat=-33.5)` should be flagged — negative floats are floats"
+    );
+}
+
+// ── regression: overlapping rules report a call once ─────────────────────────
+
+#[test]
+fn compute_in_loop_reports_one_rule_per_position() {
+    use std::collections::HashMap;
+    let diags = check_fixture("loop_context.py");
+    let mut by_pos: HashMap<(usize, usize), Vec<&str>> = HashMap::new();
+    for d in &diags {
+        by_pos
+            .entry((d.line, d.column))
+            .or_default()
+            .push(d.rule_id);
+    }
+    for (pos, ids) in by_pos {
+        let compute_rules: Vec<_> = ids
+            .iter()
+            .filter(|id| matches!(**id, "XR005" | "DK001" | "DK002"))
+            .collect();
+        assert!(
+            compute_rules.len() <= 1,
+            "position {pos:?} reported by several compute-in-loop rules: {compute_rules:?}"
+        );
+    }
 }

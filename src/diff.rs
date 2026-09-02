@@ -1,7 +1,11 @@
 //! Git diff integration for `xray --diff <REF>`.
 //!
-//! Calls `git diff --name-only --diff-filter=ACMR <REF>` and returns the
-//! subset of changed files that are Python source files (`.py`).
+//! Calls `git diff --name-only --relative --diff-filter=ACMR <REF>` and returns
+//! the subset of changed files xray can lint (`.py`, `.ipynb`).
+//!
+//! `--relative` matters: without it git reports paths from the repository root,
+//! so running `xray --diff origin/main` from a subdirectory produced a "could
+//! not parse" error for every changed file.
 //!
 //! `--diff-filter=ACMR` selects Added, Copied, Modified, and Renamed files,
 //! deliberately excluding Deleted files which no longer exist on disk.
@@ -15,7 +19,13 @@ use anyhow::{Context, Result};
 /// the ref is invalid.
 pub fn changed_python_files(git_ref: &str) -> Result<Vec<String>> {
     let output = std::process::Command::new("git")
-        .args(["diff", "--name-only", "--diff-filter=ACMR", git_ref])
+        .args([
+            "diff",
+            "--name-only",
+            "--relative",
+            "--diff-filter=ACMR",
+            git_ref,
+        ])
         .output()
         .with_context(
             || "failed to run `git diff` — is git installed and is this a git repository?",
@@ -29,11 +39,7 @@ pub fn changed_python_files(git_ref: &str) -> Result<Vec<String>> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout
-        .lines()
-        .filter(|l| !l.is_empty() && l.ends_with(".py"))
-        .map(str::to_string)
-        .collect())
+    Ok(parse_diff_output(&stdout))
 }
 
 /// Parse the raw multi-line stdout of `git diff --name-only` into a filtered
@@ -41,7 +47,8 @@ pub fn changed_python_files(git_ref: &str) -> Result<Vec<String>> {
 pub fn parse_diff_output(stdout: &str) -> Vec<String> {
     stdout
         .lines()
-        .filter(|l| !l.is_empty() && l.ends_with(".py"))
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && crate::runner::is_lintable_path(l))
         .map(str::to_string)
         .collect()
 }

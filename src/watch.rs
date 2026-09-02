@@ -25,7 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{cli::Cli, config::Config, ignore::IgnorePatterns, parser, rules};
+use crate::{cli::Cli, config::Config, ignore::IgnorePatterns, runner};
 
 /// Run the watch loop.  Lints all matching files on start, then re-lints on
 /// every `.py` file-save event.  Blocks until the user presses Ctrl-C.
@@ -33,7 +33,7 @@ pub fn run_watch(cli: &Cli, config: &Config) -> Result<()> {
     // ── Initial lint ──────────────────────────────────────────────────────────
     eprintln!("xray: starting watch mode (Ctrl-C to stop)");
     eprintln!("{}", "─".repeat(72));
-    lint_and_print_paths(&collect_watch_paths(cli, config)?, config);
+    lint_and_print_paths(cli, &collect_watch_paths(cli, config)?, config);
     eprintln!("{}", "─".repeat(72));
 
     // ── Set up file watcher ───────────────────────────────────────────────────
@@ -96,7 +96,7 @@ pub fn run_watch(cli: &Cli, config: &Config) -> Result<()> {
                 if paths.len() == 1 { "" } else { "s" }
             );
             eprintln!("{}", "─".repeat(72));
-            lint_and_print_paths(&paths, config);
+            lint_and_print_paths(cli, &paths, config);
             eprintln!("{}", "─".repeat(72));
         }
     }
@@ -115,29 +115,14 @@ fn watch_roots(cli: &Cli) -> Vec<String> {
 }
 
 fn collect_watch_paths(cli: &Cli, config: &Config) -> Result<Vec<String>> {
-    use glob::glob;
-
     let raw_patterns: Vec<String> = if cli.paths.is_empty() {
         config.paths.include.clone()
     } else {
         cli.paths.clone()
     };
 
-    let mut paths = Vec::new();
-    for pattern in &raw_patterns {
-        if Path::new(pattern).is_file() {
-            paths.push(pattern.clone());
-            continue;
-        }
-        for entry in glob(pattern)
-            .map_err(|e| anyhow::anyhow!("invalid glob: {e}"))?
-            .flatten()
-        {
-            if let Some(s) = entry.to_str() {
-                paths.push(s.to_string());
-            }
-        }
-    }
+    // Same expansion as a batch run: files, directories and globs all work.
+    let mut paths = runner::collect_paths_pub(&raw_patterns)?;
 
     // Apply excludes and .xrayignore
     let ignore = IgnorePatterns::load(".");
@@ -152,45 +137,37 @@ fn collect_watch_paths(cli: &Cli, config: &Config) -> Result<Vec<String>> {
     Ok(paths)
 }
 
-fn lint_and_print_paths(paths: &[String], config: &Config) {
-    let mut total = 0usize;
-    for path in paths {
-        match parser::parse_file(path) {
-            Ok(parsed) => {
-                let diags = rules::run_all(&parsed, path, config);
-                total += diags.len();
-                for d in &diags {
-                    eprintln!("  {}:{}: [{}] {}", d.file, d.line, d.rule_id, d.message);
-                    if let Some(ref fix) = d.fix_hint {
-                        eprintln!("    fix: {fix}");
-                    }
-                }
-            }
-            Err(e) => eprintln!("xray: could not parse {path}: {e}"),
-        }
+/// Re-lint `paths` through the normal runner pipeline so that `--min-severity`,
+/// `--disable`, `[severity_overrides]` and `--format` behave exactly as they do
+/// in a batch run.
+fn lint_and_print_paths(cli: &Cli, paths: &[String], config: &Config) {
+    if paths.is_empty() {
+        eprintln!("  no files to lint");
+        return;
     }
-    if total == 0 {
-        eprintln!(
-            "  ✓ no issues found in {} file{}",
-            paths.len(),
-            if paths.len() == 1 { "" } else { "s" }
-        );
-    } else {
-        eprintln!(
-            "  {} issue{} found",
-            total,
-            if total == 1 { "" } else { "s" }
-        );
+    // Feed the resolved paths back in as positional arguments; everything else
+    // (formatting, filtering, notebook handling) is the runner's job.
+    let mut sub = cli.clone();
+    sub.paths = paths.to_vec();
+    sub.watch = false;
+    sub.diff = None;
+    sub.stats = false;
+    if let Err(e) = runner::run(&sub, config) {
+        eprintln!("xray: {e}");
     }
 }
 
+/// Watch every file type xray can lint, notebooks included — batch mode
+/// already handles `.ipynb`, so watch mode should too.
 fn is_python_file(path: &Path) -> bool {
-    path.extension().is_some_and(|ext| ext == "py")
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| runner::LINTABLE_EXTENSIONS.contains(&e))
 }
 
 fn is_modify_event(event: &Event) -> bool {
-    matches!(
-        event.kind,
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-    )
+    // `Remove` is deliberately absent: a deleted file cannot be linted, and
+    // treating deletions as changes produced a "could not parse" error for
+    // every file the user removed.
+    matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_))
 }

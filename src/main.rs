@@ -60,7 +60,11 @@ fn main() {
                 std::process::exit(2);
             });
 
-            let exit_code = if results.has_errors() { 1 } else { 0 };
+            let exit_code = if results.should_fail(cli.fail_on) {
+                1
+            } else {
+                0
+            };
             std::process::exit(exit_code);
         }
     }

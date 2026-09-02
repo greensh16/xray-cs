@@ -45,8 +45,14 @@
   arguments: (argument_list
     [
       (float) @xr_sel_float_pos
+      ; Negative literals parse as unary_operator, not float — without this
+      ; southern latitudes and western longitudes were silently skipped.
+      (unary_operator argument: (float)) @xr_sel_float_pos
       (keyword_argument
         value: (float) @xr_sel_float_kw
+      )
+      (keyword_argument
+        value: (unary_operator argument: (float)) @xr_sel_float_kw
       )
     ]
   )

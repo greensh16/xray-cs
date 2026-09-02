@@ -12,7 +12,7 @@
 //! The server publishes `textDocument/publishDiagnostics` notifications
 //! after every open/save event.  No async runtime is required.
 
-use crate::{config::Config, parser, rules};
+use crate::{config::Config, parser, rules, runner};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, BufWriter, Write};
 
@@ -119,18 +119,18 @@ pub fn run_lsp() {
 
             _ => {
                 // Unknown method — send MethodNotFound for requests, ignore notifications
-                if let Some(req_id) = id {
-                    if !shutdown_requested {
-                        let err = json!({
-                            "jsonrpc": "2.0",
-                            "id": req_id,
-                            "error": {
-                                "code": -32601,
-                                "message": format!("Method not found: {method}")
-                            }
-                        });
-                        write_message(&mut writer, &err.to_string());
-                    }
+                if let Some(req_id) = id
+                    && !shutdown_requested
+                {
+                    let err = json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {
+                            "code": -32601,
+                            "message": format!("Method not found: {method}")
+                        }
+                    });
+                    write_message(&mut writer, &err.to_string());
                 }
             }
         }
@@ -163,8 +163,11 @@ pub fn read_message(reader: &mut impl BufRead) -> Option<String> {
         if trimmed.is_empty() {
             break; // blank line separates headers from body
         }
-        if let Some(val) = trimmed.strip_prefix("Content-Length: ") {
-            content_length = val.parse().ok();
+        // Header names are case-insensitive; some clients send `content-length`.
+        if let Some((name, val)) = trimmed.split_once(':')
+            && name.eq_ignore_ascii_case("Content-Length")
+        {
+            content_length = val.trim().parse().ok();
         }
     }
 
@@ -187,14 +190,22 @@ fn write_message(writer: &mut impl Write, json: &str) {
 
 fn lint_text(text: String, uri: &str, config: &Config) -> Vec<Value> {
     match parser::parse_source(text) {
-        Ok(parsed) => xray_diags_to_lsp(rules::run_all(&parsed, uri, config)),
+        Ok(parsed) => {
+            let mut diags = rules::run_all(&parsed, uri, config);
+            runner::apply_config_filters(&mut diags, config);
+            xray_diags_to_lsp(diags)
+        }
         Err(_) => vec![],
     }
 }
 
 fn lint_path(path: &str, config: &Config) -> Vec<Value> {
     match parser::parse_file(path) {
-        Ok(parsed) => xray_diags_to_lsp(rules::run_all(&parsed, path, config)),
+        Ok(parsed) => {
+            let mut diags = rules::run_all(&parsed, path, config);
+            runner::apply_config_filters(&mut diags, config);
+            xray_diags_to_lsp(diags)
+        }
         Err(_) => vec![],
     }
 }
@@ -260,20 +271,29 @@ pub fn uri_to_path(uri: &str) -> Option<String> {
     Some(percent_decode(path))
 }
 
+/// Decode percent-escapes into bytes, then interpret the result as UTF-8.
+///
+/// Decoding each escape straight into a `char` treated the byte as Latin-1, so
+/// a path containing `%C3%A9` came back as `Ã©` rather than `é` and the file
+/// could not be opened.
 fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            let hi = chars.next().unwrap_or('0');
-            let lo = chars.next().unwrap_or('0');
-            let byte = u8::from_str_radix(&format!("{hi}{lo}"), 16).unwrap_or(0);
-            out.push(byte as char);
-        } else {
-            out.push(c);
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            // A malformed escape is kept verbatim rather than dropped.
+            if let Some(byte) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
         }
+        out.push(bytes[i]);
+        i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ── unit tests ────────────────────────────────────────────────────────────────

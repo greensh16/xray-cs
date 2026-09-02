@@ -2,7 +2,12 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::{collections::HashMap, collections::HashSet, path::Path};
 
+use crate::cli::MinSeverity;
+
+/// Every section denies unknown fields: a mistyped key used to be parsed and
+/// silently discarded, so `disabel = [...]` looked like it worked.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Rule IDs to disable entirely (e.g. `["NP003", "IO001"]`).
     #[serde(default)]
@@ -12,6 +17,11 @@ pub struct Config {
     /// Example: `{ "XR002" = "error", "NP003" = "hint" }`
     #[serde(default)]
     pub severity_overrides: HashMap<String, String>,
+
+    /// Minimum severity to report.  Overridden by `--min-severity` / the
+    /// `XRAY_MIN_SEVERITY` environment variable when either is supplied.
+    #[serde(default)]
+    pub min_severity: Option<MinSeverity>,
 
     /// Default file include/exclude globs (used when no paths are given on the CLI).
     #[serde(default)]
@@ -34,6 +44,7 @@ pub struct Config {
 
 /// `[paths]` section — controls which files are linted by default.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PathsConfig {
     /// Glob patterns to include.  Defaults to `["**/*.py"]`.
     #[serde(default = "default_include_globs")]
@@ -60,6 +71,7 @@ fn default_include_globs() -> Vec<String> {
 // ── domain configs ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct XarrayConfig {
     /// Treat .values access as error rather than warning.
     #[serde(default)]
@@ -67,6 +79,7 @@ pub struct XarrayConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DaskConfig {
     /// Max number of .compute() calls before flagging as suspicious.
     #[serde(default = "default_compute_threshold")]
@@ -82,6 +95,7 @@ impl Default for DaskConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NumpyConfig {
     #[serde(default = "default_true")]
     pub flag_iterrows: bool,
@@ -96,8 +110,12 @@ impl Default for NumpyConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IoConfig {
-    /// Flag open_dataset calls missing compression hints.
+    /// Flag storage formats written without compression or chunking:
+    /// IO001 (`np.save`) and IO002 (direct `netCDF4.Dataset` open).
+    ///
+    /// This key was previously parsed but read by no rule at all.
     #[serde(default = "default_true")]
     pub flag_missing_compression: bool,
 }
@@ -123,7 +141,23 @@ impl Config {
     pub fn from_file(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("Cannot read config: {}", path.display()))?;
-        toml::from_str(&raw).with_context(|| format!("Cannot parse config: {}", path.display()))
+        let mut cfg: Self = toml::from_str(&raw)
+            .with_context(|| format!("Cannot parse config: {}", path.display()))?;
+        cfg.normalise();
+        Ok(cfg)
+    }
+
+    /// Upper-case every rule ID so that `disable = ["xr001"]` behaves the same
+    /// as `disable = ["XR001"]`.  `validate()` has always compared
+    /// case-insensitively, so without this a lowercase ID passed validation
+    /// and then silently matched nothing.
+    fn normalise(&mut self) {
+        self.disable = self.disable.iter().map(|id| id.to_uppercase()).collect();
+        self.severity_overrides = self
+            .severity_overrides
+            .drain()
+            .map(|(id, sev)| (id.to_uppercase(), sev.to_lowercase()))
+            .collect();
     }
 
     /// Walk up directories looking for xray.toml.

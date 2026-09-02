@@ -17,8 +17,8 @@ use crate::parser::{self, ImportContext, ParsedFile};
 pub struct NotebookCell {
     /// 1-based index counting only *code* cells (markdown/raw cells are skipped).
     pub index: usize,
-    /// Display label used as the `file` field in diagnostics, e.g.
-    /// `analysis.ipynb:cell[3]`.
+    /// Human-readable label for parse errors, e.g. `analysis.ipynb:cell[3]`.
+    /// Diagnostics keep the real notebook path and record the cell separately.
     pub label: String,
     /// Cell source with magic lines blanked out (blank lines preserve the
     /// original per-cell line numbers in diagnostics).

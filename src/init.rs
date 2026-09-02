@@ -7,8 +7,12 @@ const TEMPLATE: &str = r#"# xray.toml — HPC scientific Python linter configura
 # Run `xray explain <RULE_ID>` for rationale and examples.
 
 # ── Global rule control ────────────────────────────────────────────────────────
-# Disable specific rules for the entire project.  Rule IDs are case-sensitive.
+# Disable specific rules for the entire project.  Rule IDs are case-insensitive.
 # disable = ["NP003", "IO001"]
+
+# Lowest severity to report.  One of: "hint" | "warning" | "error".
+# Overridden by --min-severity / XRAY_MIN_SEVERITY on the command line.
+# min_severity = "hint"
 
 
 # ── Per-rule severity overrides ────────────────────────────────────────────────
@@ -53,7 +57,8 @@ const TEMPLATE: &str = r#"# xray.toml — HPC scientific Python linter configura
 
 # ── I/O rules ─────────────────────────────────────────────────────────────────
 [io]
-# Flag np.save and netCDF4.Dataset direct-open patterns (IO001, IO002).
+# Flag uncompressed / unchunked storage patterns:
+# np.save (IO001) and direct netCDF4.Dataset opens (IO002).
 # flag_missing_compression = true
 "#;
 

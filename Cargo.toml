@@ -1,6 +1,6 @@
 [package]
 name = "xray"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "HPC scientific Python linter for xarray, dask, and NumPy workflows"
 authors = ["greensh16 <greensh16@users.noreply.github.com>"]
@@ -11,12 +11,17 @@ documentation = "https://github.com/greensh16/xray/wiki"
 readme = "README.md"
 keywords = ["linter", "hpc", "xarray", "dask", "numpy"]
 categories = ["development-tools", "science", "command-line-utilities"]
+# `tests/fixtures/` and `benches/` are deliberately included: the manifest
+# declares a bench target and ships the integration tests, so excluding their
+# sources left the published crate unable to run `cargo test` or `cargo bench`.
 exclude = [
-    "tests/fixtures/",
-    "benches/",
     "docs/",
     "editors/",
-    ".github/",
+    "old/",
+    "xray.wiki/",
+    "ToFix.md",
+    "ROADMAP.md",
+    "xray.toml",
 ]
 
 [[bin]]

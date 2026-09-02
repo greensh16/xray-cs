@@ -1,0 +1,143 @@
+name: 'xray — HPC Scientific Python Linter'
+description: >
+  Run xray, the zero-dependency scientific Python linter for HPC workflows
+  targeting xarray, dask, NumPy, pandas, and scientific I/O patterns.
+author: 'greensh16'
+
+branding:
+  icon: 'zap'
+  color: 'blue'
+
+inputs:
+  paths:
+    description: >
+      Python files or glob patterns to lint (space-separated).
+      Defaults to all Python files recursively.
+    required: false
+    default: '**/*.py'
+
+  min-severity:
+    description: >
+      Minimum severity level to report.
+      One of: hint | warning | error
+    required: false
+    default: 'hint'
+
+  format:
+    description: >
+      Output format.
+      One of: text | json | sarif | gitlab-codequality
+    required: false
+    default: 'sarif'
+
+  fail-on:
+    description: >
+      Exit the action with failure if any issues are found at this severity
+      or above.  Set to "never" to always pass (useful for informational runs).
+      One of: hint | warning | error | never
+    required: false
+    default: 'error'
+
+  config:
+    description: >
+      Path to an xray.toml configuration file.
+      If not set, xray walks up from the repository root to find one.
+    required: false
+    default: ''
+
+  xray-version:
+    description: >
+      xray release tag to install (e.g. v1.0.1).
+      Defaults to the latest published release.
+    required: false
+    default: 'latest'
+
+outputs:
+  issues-found:
+    description: 'Total number of diagnostics emitted by xray.'
+    value: ${{ steps.run-xray.outputs.issues-found }}
+
+  sarif-file:
+    description: >
+      Path to the SARIF output file (only set when format is "sarif").
+    value: ${{ steps.run-xray.outputs.sarif-file }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ── Install xray binary ────────────────────────────────────────────────────
+    - name: Install xray
+      id: install-xray
+      shell: bash
+      run: |
+        set -euo pipefail
+        VERSION="${{ inputs.xray-version }}"
+
+        if [[ "$VERSION" == "latest" ]]; then
+          VERSION=$(curl -sSfL \
+            https://api.github.com/repos/greensh16/xray/releases/latest \
+            | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+        fi
+
+        # Asset names must match .github/workflows/release.yml exactly:
+        # bare binaries, one per platform.
+        OS=$(uname -s)
+        ARCH=$(uname -m)
+        case "${OS}-${ARCH}" in
+          Linux-x86_64)            ASSET="xray-linux-x86_64" ;;
+          Linux-aarch64|Linux-arm64) ASSET="xray-linux-aarch64" ;;
+          Darwin-arm64)            ASSET="xray-macos-arm64" ;;
+          *)
+            echo "::error::Unsupported runner platform: ${OS} ${ARCH}"
+            exit 1 ;;
+        esac
+
+        URL="https://github.com/greensh16/xray/releases/download/${VERSION}/${ASSET}"
+        echo "Downloading xray ${VERSION} from ${URL}"
+        curl -sSfL "$URL" -o /usr/local/bin/xray
+        chmod +x /usr/local/bin/xray
+        xray --version
+
+    # ── Run xray ──────────────────────────────────────────────────────────────
+    - name: Run xray
+      id: run-xray
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        FORMAT="${{ inputs.format }}"
+        MIN_SEV="${{ inputs.min-severity }}"
+        FAIL_ON="${{ inputs.fail-on }}"
+        PATHS="${{ inputs.paths }}"
+        CONFIG_ARG=""
+        if [[ -n "${{ inputs.config }}" ]]; then
+          CONFIG_ARG="--config ${{ inputs.config }}"
+        fi
+
+        SARIF_FILE="${GITHUB_WORKSPACE}/xray-results.sarif"
+
+        # Count diagnostics from the JSON envelope so `issues-found` is a real
+        # total rather than a 0/1 flag derived from the exit code.
+        COUNT_JSON=$(xray --format json --min-severity "${MIN_SEV}" --fail-on never \
+          ${CONFIG_ARG} ${PATHS} || true)
+        ISSUES=$(printf '%s' "$COUNT_JSON" | python3 -c \
+          'import json,sys; print(json.load(sys.stdin)["summary"]["total"])' 2>/dev/null || echo 0)
+        echo "issues-found=${ISSUES}" >> "$GITHUB_OUTPUT"
+
+        # xray applies the severity gate itself, so every documented value of
+        # fail-on (hint | warning | error | never) is honoured.
+        CMD=(xray --format "${FORMAT}" --min-severity "${MIN_SEV}" --fail-on "${FAIL_ON}")
+        if [[ -n "$CONFIG_ARG" ]]; then
+          CMD+=(--config "${{ inputs.config }}")
+        fi
+
+        EXIT_CODE=0
+        if [[ "$FORMAT" == "sarif" ]]; then
+          "${CMD[@]}" ${PATHS} > "$SARIF_FILE" || EXIT_CODE=$?
+          echo "sarif-file=${SARIF_FILE}" >> "$GITHUB_OUTPUT"
+        else
+          "${CMD[@]}" ${PATHS} || EXIT_CODE=$?
+        fi
+
+        # Exit code 2 is an internal error and always fails the step.
+        exit $EXIT_CODE

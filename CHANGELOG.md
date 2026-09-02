@@ -11,6 +11,98 @@ xray uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.0.1] — 2026-09-02
+
+A correctness and accuracy release. Every change is a fix to behaviour that
+shipped in 1.0.0; no rule IDs, config keys or output schemas changed
+incompatibly.
+
+### Added
+
+- **`--fail-on <hint|warning|error|never>`** (env `XRAY_FAIL_ON`) — controls the
+  lowest severity that makes xray exit non-zero, independently of what is
+  reported. Defaults to `error`, which is exactly 1.0.0's behaviour, so existing
+  pipelines are unaffected. `never` always exits 0, for report-only runs.
+- **`min_severity` in `xray.toml`** — the key was documented but silently
+  ignored; it is now read, and `--min-severity` on the command line overrides it.
+- **`cell` field on notebook diagnostics** in JSON output, alongside the real
+  notebook path in `file`.
+- **SARIF `originalUriBaseIds` / `uriBaseId`** and `properties.notebookCell`.
+- **Two regression fixtures** — `tests/fixtures/false_positives.py`, which must
+  stay silent, and `tests/fixtures/loop_context.py`, which pins comprehension,
+  `while`-loop and loop-header behaviour.
+
+### Changed
+
+- **Directory arguments are walked recursively.** `xray src/` previously matched
+  nothing and exited 0 — a silent pass. Paths are now expanded, normalised and
+  deduplicated, so the same file passed twice is linted once.
+- **Rule IDs are case-insensitive** in both `--disable` and `xray.toml`, matching
+  the validation that already accepted them.
+- **Unknown `xray.toml` keys are now rejected** rather than silently ignored, so
+  a typo'd key fails loudly instead of quietly doing nothing.
+- **Text output goes to stdout** rather than stderr.
+- **`--diff` uses `--relative --diff-filter=ACMR`** and includes `.ipynb` files.
+- **Watch mode honours every filter** — severity, disables, format and config are
+  applied to re-lints exactly as in a batch run.
+- **The published crate ships its fixtures and benches**, so `cargo test` works
+  from a registry checkout.
+
+### Performance
+
+- **Tree-sitter queries are compiled once per process** instead of once per file.
+  Linting 500 files went from 23.19 s to 0.55 s of CPU (3.51 s to 0.12 s wall) —
+  roughly 45× less CPU.
+- **Source files are read once per file** when rendering text output, rather than
+  once per diagnostic.
+
+### Fixed
+
+Rule accuracy — each of these fired on correct code:
+
+- **XR003** flagged any attribute iterated in a `for` loop (`for f in self.files`);
+  it is now gated on an allow-list of dimension names.
+- **XR007 / XR010 / DK007 / DK009 / IO001 / IO003 / IO005** identified their target
+  by receiver name alone, so `pd.concat` was reported as `xr.concat` and the
+  builtin `open()` as `zarr.open()`. Receivers are now resolved through the file's
+  import aliases, which also makes `import dask.array as dsa` work.
+- **IO004** flagged every subscript inside a loop, including plain list and dict
+  indexing; it now requires a netCDF4-derived handle.
+- **NP005** flagged any double subscript, including `grid[i][j]`; it now requires a
+  string key.
+- **IO006** could never fire, because the I/O domain was not gated on `xarray`.
+- **`**kwargs` spread no longer defeats the "missing keyword" rules** — XR001,
+  XR006, XR011, DK007 and IO005 stay silent when a call forwards `**kwargs`,
+  where the argument may well be present.
+- **XR004** now matches negative float coordinates (`ds.sel(lat=-33.5)`).
+- **Loop detection covers `while` loops and comprehensions**, and no longer fires
+  on calls in the loop header itself.
+- **One `.compute()` in a loop produces one diagnostic**, not the two or three
+  that XR005, DK001 and DK002 previously emitted at the same position.
+- **DK003** fires when the count exceeds `compute_call_threshold`, matching how
+  the threshold is documented, and reports the first call past it.
+
+Correctness elsewhere:
+
+- **`--stats` attributed issues to the wrong files** when any file produced no
+  diagnostics, because results were zipped against the input list positionally.
+- **The LSP server dropped `[severity_overrides]`**, `disable` and `min_severity`,
+  so editor diagnostics disagreed with the CLI.
+- **LSP percent-decoding was Latin-1**, so a path containing `%C3%A9` resolved to
+  `Ã©` and the file was not found. `Content-Length` is now matched
+  case-insensitively.
+- **Watch mode** treated file deletion as a modification and printed a parse
+  error, and ignored `.ipynb` files that batch mode linted.
+- **GitLab Code Quality fingerprints** could collide between two diagnostics on
+  the same line.
+- **XR003's suggestion printed a literal `{dim}`** instead of the dimension name.
+- **The GitHub Action downloaded a release asset that is never published**, and
+  its `issues-found` output was a boolean rather than a count.
+- **The pre-commit hook definition** pinned a stale revision and documented an
+  install command that did not work.
+
+---
+
 ## [1.0.0] — 2026-03-19
 
 ### Added
@@ -283,7 +375,8 @@ xray uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-[Unreleased]: https://github.com/greensh16/xray/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/greensh16/xray/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/greensh16/xray/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/greensh16/xray/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/greensh16/xray/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/greensh16/xray/compare/v0.7.0...v0.8.0

@@ -1,0 +1,42 @@
+# xray pre-commit hooks
+#
+# Add to your .pre-commit-config.yaml:
+#
+#   repos:
+#     - repo: https://github.com/greensh16/xray
+#       rev: v1.0.1          # pin to a release tag
+#       hooks:
+#         - id: xray         # lint all staged Python files
+#
+# The hook passes staged filenames to xray as positional arguments.
+# xray must already be installed and on PATH.  On HPC systems, load it via
+# a module file or install the binary to ~/bin before running pre-commit.
+#
+# To install the binary (asset names match the release workflow):
+#   curl -sSfL -o ~/.local/bin/xray \
+#     https://github.com/greensh16/xray/releases/latest/download/xray-linux-x86_64
+#   chmod +x ~/.local/bin/xray
+
+- id: xray
+  name: xray — HPC scientific Python linter
+  language: system
+  entry: xray
+  types: [python]
+  pass_filenames: true
+  description: >
+    Lint Python source files for xarray, dask, NumPy, and scientific I/O
+    anti-patterns common in HPC workflows.
+
+- id: xray-warn-only
+  name: xray — HPC scientific Python linter (warnings only, non-blocking)
+  language: system
+  entry: xray --min-severity warning --fail-on never
+  types: [python]
+  pass_filenames: true
+  verbose: true
+  # This variant reports but never blocks the commit: `--fail-on never` makes
+  # xray exit 0 whatever it finds, so the claim below is actually enforced.
+  stages: [pre-commit]
+  description: >
+    Like xray but only reports warnings and errors; hints are suppressed.
+    Exits 0 regardless of findings (verbose output only).

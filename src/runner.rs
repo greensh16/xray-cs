@@ -106,7 +106,10 @@ fn lint_python(path: &str, config: &Config, cli: &Cli) -> Option<FileResults> {
         Ok(parsed) => {
             let mut diags = rules::run_all(&parsed, path, config);
             apply_filters(&mut diags, config, cli);
-            Some(FileResults { diagnostics: diags })
+            Some(FileResults {
+                path: path.to_string(),
+                diagnostics: diags,
+            })
         }
         Err(e) => {
             eprintln!("xray: could not parse {path}: {e}");
@@ -137,9 +140,13 @@ fn lint_notebook(path: &str, config: &Config, cli: &Cli) -> Option<FileResults> 
         let cell_source = cell.source.clone();
         let mut diags = rules::run_all(&cell.parsed, &cell.label, config);
 
-        // Attach the cell source so `render_text` can display correct context.
+        // Attach the cell source so `render_text` can display correct context,
+        // and restore the real notebook path — a `nb.ipynb:cell[3]` label is
+        // not a resolvable location for SARIF or GitLab consumers.
         for d in &mut diags {
             d.source_override = Some(cell_source.clone());
+            d.file = path.to_string();
+            d.cell = Some(cell.index);
         }
 
         apply_filters(&mut diags, config, cli);
@@ -147,6 +154,7 @@ fn lint_notebook(path: &str, config: &Config, cli: &Cli) -> Option<FileResults> 
     }
 
     Some(FileResults {
+        path: path.to_string(),
         diagnostics: all_diags,
     })
 }
@@ -155,28 +163,65 @@ fn lint_notebook(path: &str, config: &Config, cli: &Cli) -> Option<FileResults> 
 /// to a set of diagnostics.  Extracted to avoid duplicating the logic between
 /// `lint_python` and `lint_notebook`.
 fn apply_filters(diags: &mut Vec<Diagnostic>, config: &Config, cli: &Cli) {
+    // Rule IDs are compared case-insensitively everywhere: `--disable xr001`
+    // and `disable = ["xr001"]` now behave like the canonical upper-case form.
+    let cli_disabled: Vec<String> = cli.disable.iter().map(|id| id.to_uppercase()).collect();
+    let min = effective_min_severity(cli, config);
+
+    apply_severity_overrides(diags, config);
+    diags.retain(|d| !cli_disabled.iter().any(|id| id == d.rule_id));
+    diags.retain(|d| severity_passes(&d.severity, &min));
+}
+
+/// Apply `[severity_overrides]` in place.
+pub fn apply_severity_overrides(diags: &mut [Diagnostic], config: &Config) {
     for diag in diags.iter_mut() {
-        if let Some(sev_str) = config.severity_overrides.get(diag.rule_id) {
-            if let Some(sev) = parse_severity(sev_str) {
-                diag.severity = sev;
-            }
+        if let Some(sev_str) = config.severity_overrides.get(diag.rule_id)
+            && let Some(sev) = parse_severity(sev_str)
+        {
+            diag.severity = sev;
         }
     }
-    diags.retain(|d| !cli.disable.contains(&d.rule_id.to_string()));
-    diags.retain(|d| severity_passes(&d.severity, &cli.min_severity));
+}
+
+/// Config-only filtering, for callers that have no CLI flags to consult —
+/// currently the LSP server, which previously published raw rule output and so
+/// ignored `[severity_overrides]` and `min_severity` entirely.
+pub fn apply_config_filters(diags: &mut Vec<Diagnostic>, config: &Config) {
+    apply_severity_overrides(diags, config);
+    if let Some(min) = config.min_severity {
+        diags.retain(|d| severity_passes(&d.severity, &min));
+    }
+}
+
+/// `--min-severity` (or `XRAY_MIN_SEVERITY`) wins over `min_severity` in
+/// xray.toml; with neither set, every severity is reported.
+pub fn effective_min_severity(cli: &Cli, config: &Config) -> MinSeverity {
+    cli.min_severity
+        .or(config.min_severity)
+        .unwrap_or(MinSeverity::Hint)
 }
 
 // ── format: text ──────────────────────────────────────────────────────────────
 
 fn render_text(results: &RunResults, _paths: &[String]) {
+    // Diagnostics go to stdout so `xray > report.txt` captures them, matching
+    // the JSON/SARIF/GitLab renderers.  Only operational messages (parse
+    // failures, config warnings) stay on stderr.
+    let mut cache: HashMap<&str, String> = HashMap::new();
+
     for diag in results.all_diagnostics() {
         // For notebook cell diagnostics `diag.file` is a display label like
         // `notebook.ipynb:cell[3]` that cannot be read from disk — use the
         // pre-populated `source_override` instead.
+        // Read each file once, not once per diagnostic.
         let source_text = if let Some(ref src) = diag.source_override {
             src.clone()
         } else {
-            std::fs::read_to_string(&diag.file).unwrap_or_default()
+            cache
+                .entry(diag.file.as_str())
+                .or_insert_with(|| std::fs::read_to_string(&diag.file).unwrap_or_default())
+                .clone()
         };
 
         let kind = match diag.severity {
@@ -187,12 +232,13 @@ fn render_text(results: &RunResults, _paths: &[String]) {
 
         let offset = line_col_to_offset(&source_text, diag.line, diag.column);
 
-        let mut report = Report::build(kind, (diag.file.clone(), offset..offset + 1))
+        let location = diag.display_location();
+        let mut report = Report::build(kind, (location.clone(), offset..offset + 1))
             .with_code(diag.rule_id)
             .with_message(&diag.message);
 
         report = report.with_label(
-            Label::new((diag.file.clone(), offset..offset + 1))
+            Label::new((location.clone(), offset..offset + 1))
                 .with_message(&diag.message)
                 .with_color(match diag.severity {
                     Severity::Error => Color::Red,
@@ -216,7 +262,7 @@ fn render_text(results: &RunResults, _paths: &[String]) {
 
         report
             .finish()
-            .eprint((diag.file.clone(), Source::from(&source_text)))
+            .print((location, Source::from(&source_text)))
             .ok();
     }
 
@@ -224,7 +270,7 @@ fn render_text(results: &RunResults, _paths: &[String]) {
     if total == 0 {
         println!("xray: no issues found.");
     } else {
-        eprintln!(
+        println!(
             "\nxray: {} issue{} found.",
             total,
             if total == 1 { "" } else { "s" }
@@ -323,6 +369,9 @@ pub fn build_sarif_json(results: &RunResults) -> Result<String> {
                 }
             },
             "results": results_arr,
+            "originalUriBaseIds": {
+                "SRCROOT": { "description": { "text": "Directory xray was run from" } }
+            },
         }]
     });
 
@@ -339,7 +388,7 @@ fn build_sarif_result(d: &Diagnostic) -> Value {
             "physicalLocation": {
                 "artifactLocation": {
                     "uri": d.file,
-                    "uriBaseId": "%SRCROOT%",
+                    "uriBaseId": "SRCROOT",
                 },
                 "region": {
                     "startLine": d.line,
@@ -360,6 +409,11 @@ fn build_sarif_result(d: &Diagnostic) -> Value {
     // Attach docs URL as a related location / help URI
     if let Some(url) = d.url {
         result["helpUri"] = json!(url);
+    }
+
+    // Notebook cell index, for consumers that can use it.
+    if let Some(cell) = d.cell {
+        result["properties"] = json!({ "notebookCell": cell });
     }
 
     result
@@ -390,10 +444,16 @@ pub fn build_gitlab_json(results: &RunResults) -> Result<String> {
 
 fn build_gitlab_entry(d: &Diagnostic) -> Value {
     let severity = severity_to_gitlab(d.severity);
-    // Fingerprint: deterministic hash of rule_id + file + line
+    // Fingerprint: deterministic hash of rule_id + file + position + message.
+    // GitLab requires fingerprints to be unique within a report, and two
+    // diagnostics from the same rule can legitimately share a line (different
+    // columns), so the column and message are part of the hash.
     let fingerprint = format!(
         "{:x}",
-        simple_hash(&format!("{}{}{}", d.rule_id, d.file, d.line))
+        simple_hash(&format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            d.rule_id, d.file, d.line, d.column, d.message
+        ))
     );
 
     json!({
@@ -417,7 +477,8 @@ fn severity_to_gitlab(sev: Severity) -> &'static str {
 }
 
 /// A deterministic, dependency-free hash for fingerprinting diagnostics.
-/// Uses FNV-1a 64-bit, which is sufficient for a stable CI fingerprint.
+/// FNV-1 64-bit (multiply, then xor), which is sufficient for a stable CI
+/// fingerprint — this is not a cryptographic hash.
 fn simple_hash(s: &str) -> u64 {
     const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
     const FNV_PRIME: u64 = 1_099_511_628_211;
@@ -463,7 +524,7 @@ fn print_rule_list() {
 /// Print per-rule and per-file summary tables (activated by --stats).
 fn print_stats(results: &RunResults) {
     let total = results.total();
-    let file_count = results.paths.len();
+    let file_count = results.files.len();
 
     eprintln!();
     eprintln!(
@@ -497,18 +558,17 @@ fn print_stats(results: &RunResults) {
     }
 
     let files_with_issues: Vec<_> = results
-        .paths
+        .files
         .iter()
-        .zip(results.files.iter())
-        .filter(|(_, fr)| !fr.diagnostics.is_empty())
+        .filter(|fr| !fr.diagnostics.is_empty())
         .collect();
 
     if !files_with_issues.is_empty() {
         eprintln!();
         eprintln!("  {:<52}  {:>6}", "FILE", "ISSUES");
         eprintln!("  {}  {}", "─".repeat(52), "─".repeat(6));
-        for (path, fr) in &files_with_issues {
-            let trimmed = path.trim_start_matches("./");
+        for fr in &files_with_issues {
+            let trimmed = fr.path.trim_start_matches("./");
             let display = if trimmed.len() > 52 {
                 format!("…{}", &trimmed[trimmed.len() - 51..])
             } else {
@@ -526,23 +586,94 @@ pub fn collect_paths_pub(patterns: &[String]) -> Result<Vec<String>> {
     collect_paths(patterns)
 }
 
-fn collect_paths(patterns: &[String]) -> Result<Vec<String>> {
-    let mut paths = Vec::new();
-    for pattern in patterns {
-        if std::path::Path::new(pattern).is_file() {
-            paths.push(pattern.clone());
-            continue;
+/// Source file extensions xray knows how to lint.
+pub const LINTABLE_EXTENSIONS: &[&str] = &["py", "ipynb"];
+
+pub fn is_lintable_path(path: &str) -> bool {
+    is_lintable(path)
+}
+
+fn is_lintable(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| LINTABLE_EXTENSIONS.contains(&e))
+}
+
+/// Expand one CLI argument or config glob into concrete file paths.
+///
+/// Three argument shapes are accepted:
+/// * a file — used as-is
+/// * a directory — expanded to every lintable file beneath it
+/// * a glob pattern — expanded by `glob`; directories it yields are themselves
+///   expanded, so `src/*` behaves sensibly
+fn expand_pattern(pattern: &str, out: &mut Vec<String>) -> Result<()> {
+    let as_path = std::path::Path::new(pattern);
+
+    if as_path.is_file() {
+        out.push(normalise(pattern));
+        return Ok(());
+    }
+
+    if as_path.is_dir() {
+        expand_dir(pattern, out)?;
+        return Ok(());
+    }
+
+    for entry in glob::glob(pattern)
+        .map_err(|e| anyhow::anyhow!("invalid glob pattern `{pattern}`: {e}"))?
+        .flatten()
+    {
+        let Some(s) = entry.to_str() else { continue };
+        if entry.is_dir() {
+            expand_dir(s, out)?;
+        } else {
+            out.push(normalise(s));
         }
-        for entry in glob::glob(pattern)
+    }
+    Ok(())
+}
+
+/// Recursively collect every lintable file under `dir`.
+fn expand_dir(dir: &str, out: &mut Vec<String>) -> Result<()> {
+    let trimmed = dir.trim_end_matches('/');
+    for ext in LINTABLE_EXTENSIONS {
+        let pattern = format!("{trimmed}/**/*.{ext}");
+        for entry in glob::glob(&pattern)
             .map_err(|e| anyhow::anyhow!("invalid glob pattern `{pattern}`: {e}"))?
             .flatten()
         {
-            if let Some(s) = entry.to_str() {
-                paths.push(s.to_string());
+            if entry.is_file()
+                && let Some(s) = entry.to_str()
+            {
+                out.push(normalise(s));
             }
         }
     }
+    Ok(())
+}
+
+/// Strip a leading `./` so the same file discovered via different patterns
+/// deduplicates, and so SARIF consumers get clean relative URIs.
+fn normalise(path: &str) -> String {
+    path.trim_start_matches("./").to_string()
+}
+
+fn collect_paths(patterns: &[String]) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for pattern in patterns {
+        expand_pattern(pattern, &mut paths)?;
+    }
+    dedupe(&mut paths);
     Ok(paths)
+}
+
+/// Remove duplicate paths while preserving discovery order.  Overlapping
+/// arguments (`xray src/ src/a.py`) or overlapping `[paths].include` globs
+/// would otherwise lint the same file — and report every diagnostic — twice.
+fn dedupe(paths: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|p| seen.insert(p.clone()));
 }
 
 fn line_col_to_offset(source: &str, line: usize, col: usize) -> usize {

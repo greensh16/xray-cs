@@ -1,3 +1,4 @@
+use std::sync::LazyLock;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Query, QueryCursor};
 
@@ -5,7 +6,8 @@ use crate::{
     config::Config,
     diagnostic::{Diagnostic, RuleMeta, Severity},
     parser::{
-        ParsedFile, has_keyword_arg, is_inside_for_loop, keyword_arg_value, node_text, position,
+        ParsedFile, call_is_from, is_inside_loop, keyword_arg_present_or_unknown,
+        keyword_arg_value, node_text, position,
     },
 };
 
@@ -14,6 +16,14 @@ use super::RuleSet;
 pub struct IoRules;
 
 const QUERY_SRC: &str = include_str!("../../queries/io.scm");
+
+/// Compiled once per process and shared across all rayon workers.
+/// `Query` is `Send + Sync`; only the `QueryCursor` needs to be per-call.
+/// A compilation failure is a bug in xray itself, so we fail loudly.
+static QUERY: LazyLock<Query> = LazyLock::new(|| {
+    Query::new(&tree_sitter_python::LANGUAGE.into(), QUERY_SRC)
+        .unwrap_or_else(|e| panic!("xray: BUG — failed to compile io query: {e}"))
+});
 
 impl RuleSet for IoRules {
     fn meta() -> Vec<RuleMeta> {
@@ -60,40 +70,27 @@ impl RuleSet for IoRules {
     fn check(file: &ParsedFile, path: &str, config: &Config) -> Vec<Diagnostic> {
         let mut diags = Vec::new();
         let source = file.source.as_bytes();
-        let lang = tree_sitter_python::LANGUAGE.into();
-
-        // Query compilation errors are a bug in xray itself — fail loudly.
-        let query = Query::new(&lang, QUERY_SRC)
-            .unwrap_or_else(|e| panic!("xray: BUG — failed to compile io query: {e}"));
+        let query = &*QUERY;
 
         let mut cursor = QueryCursor::new();
         let root = file.tree.root_node();
 
-        let mut matches = cursor.matches(&query, root, source);
+        // Names bound to a netCDF4 Dataset or one of its variables (IO004).
+        let nc_handles = netcdf_handles(file, source);
+
+        let mut matches = cursor.matches(query, root, source);
         while let Some(m) = matches.next() {
             match m.pattern_index {
                 // IO001 — np.save
-                0 if !config.is_disabled("IO001") => {
+                0 if !config.is_disabled("IO001") && config.io.flag_missing_compression => {
                     if let Some(node) = query
                         .capture_index_for_name("io_npsave_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        // Only fire for np.save / numpy.save — not any arbitrary .save() call
-                        if let Some(func) = node.child_by_field_name("function") {
-                            if func.kind() == "attribute" {
-                                if let Some(obj) = func.child_by_field_name("object") {
-                                    let obj_name = node_text(&obj, source);
-                                    if obj_name != "np" && obj_name != "numpy" {
-                                        continue;
-                                    }
-                                } else {
-                                    // attribute with no object — not np.save
-                                    continue;
-                                }
-                            } else {
-                                // bare `save(...)` call — skip (ambiguous without import check)
-                                continue;
-                            }
+                        // Only fire for numpy's save(), resolved through the
+                        // file's import aliases rather than a hard-coded `np`.
+                        if !call_is_from(node, source, &file.imports, "numpy") {
+                            continue;
                         }
                         let (line, col) = position(&node);
                         diags.push(
@@ -112,7 +109,7 @@ impl RuleSet for IoRules {
                 }
 
                 // IO002 — netCDF4.Dataset direct open
-                1 if !config.is_disabled("IO002") => {
+                1 if !config.is_disabled("IO002") && config.io.flag_missing_compression => {
                     if let Some(node) = query
                         .capture_index_for_name("io_nc4_dataset_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
@@ -141,24 +138,15 @@ impl RuleSet for IoRules {
                         .capture_index_for_name("io_zarr_open_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        // Only fire for zarr.open* — not any open() call
-                        let is_zarr_call =
-                            if let Some(func) = call_node.child_by_field_name("function") {
-                                if func.kind() == "attribute" {
-                                    func.child_by_field_name("object")
-                                        .map(|obj| node_text(&obj, source) == "zarr")
-                                        .unwrap_or(false)
-                                } else {
-                                    // bare open() — only flag if zarr is imported
-                                    file.imports.zarr
-                                }
-                            } else {
-                                false
-                            };
-                        if !is_zarr_call {
+                        // Only fire for zarr's open*(). A bare `open(...)` is
+                        // the builtin unless it was explicitly imported from
+                        // zarr — treating every bare open() as zarr flagged
+                        // `with open("notes.txt") as fh:` in any file that
+                        // imported zarr.
+                        if !call_is_from(call_node, source, &file.imports, "zarr") {
                             continue;
                         }
-                        if !has_keyword_arg(call_node, source, "chunks") {
+                        if !keyword_arg_present_or_unknown(call_node, source, "chunks") {
                             let (line, col) = position(&call_node);
                             diags.push(
                                 Diagnostic::new(
@@ -182,8 +170,19 @@ impl RuleSet for IoRules {
                         .capture_index_for_name("io_nc_subscript")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        // Only fire inside for loops when netCDF4 is imported
-                        if !file.imports.netcdf4 || !is_inside_for_loop(node) {
+                        // The query matches any `name[...]`, so without this
+                        // check every list index and dict lookup in every loop
+                        // was reported.  Only subscripts of a name that was
+                        // bound from a netCDF4 handle count.
+                        if !file.imports.netcdf4 || !is_inside_loop(node) {
+                            continue;
+                        }
+                        let var_name = query
+                            .capture_index_for_name("io_nc_var")
+                            .and_then(|i| m.nodes_for_capture_index(i).next())
+                            .map(|n| node_text(&n, source))
+                            .unwrap_or("");
+                        if !nc_handles.contains(var_name) {
                             continue;
                         }
                         let (line, col) = position(&node);
@@ -194,7 +193,9 @@ impl RuleSet for IoRules {
                                 path,
                                 line,
                                 col,
-                                "netCDF4 variable subscripted inside a for loop — each read may trigger a disk seek",
+                                format!(
+                                    "netCDF4 variable `{var_name}` subscripted inside a loop — each read may trigger a disk seek"
+                                ),
                             )
                             .with_suggestion("Pre-load the full array outside the loop with `data = nc_var[:]`, then index `data[i]`")
                             .with_url("https://github.com/greensh16/xray/wiki/IO-Rules#io004"),
@@ -208,24 +209,11 @@ impl RuleSet for IoRules {
                         .capture_index_for_name("io_h5py_file_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        // Only fire for h5py.File — not any .File() or File() call
-                        let is_h5py_call =
-                            if let Some(func) = call_node.child_by_field_name("function") {
-                                if func.kind() == "attribute" {
-                                    func.child_by_field_name("object")
-                                        .map(|obj| node_text(&obj, source) == "h5py")
-                                        .unwrap_or(false)
-                                } else {
-                                    // bare File() — only flag if h5py is imported
-                                    file.imports.h5py
-                                }
-                            } else {
-                                false
-                            };
-                        if !is_h5py_call {
+                        // Only fire for h5py's File(), resolved through imports.
+                        if !call_is_from(call_node, source, &file.imports, "h5py") {
                             continue;
                         }
-                        if !has_keyword_arg(call_node, source, "swmr") {
+                        if !keyword_arg_present_or_unknown(call_node, source, "swmr") {
                             let (line, col) = position(&call_node);
                             diags.push(
                                 Diagnostic::new(
@@ -276,4 +264,72 @@ impl RuleSet for IoRules {
 
         diags
     }
+}
+
+/// Collect local names that hold a netCDF4 `Dataset` or one of its variables.
+///
+/// A light single-pass approximation of dataflow: an assignment counts when its
+/// right-hand side calls netCDF4's `Dataset(...)`, or reads `.variables[...]`
+/// / `.createVariable(...)` off something already known to be a handle.  Good
+/// enough to distinguish `temps = nc.variables["t2m"]` from an ordinary list,
+/// which is all IO004 needs.
+fn netcdf_handles(file: &ParsedFile, source: &[u8]) -> std::collections::HashSet<String> {
+    let mut handles: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack = vec![file.tree.root_node()];
+
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+
+        if node.kind() != "assignment" {
+            continue;
+        }
+        let (Some(left), Some(right)) = (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ) else {
+            continue;
+        };
+        if left.kind() != "identifier" {
+            continue;
+        }
+
+        let rhs = node_text(&right, source);
+        let is_handle = match right.kind() {
+            // temps = nc.variables["t2m"]  /  temps = nc["t2m"]
+            "subscript" => right
+                .child_by_field_name("value")
+                .map(|v| {
+                    let text = node_text(&v, source);
+                    text.ends_with(".variables")
+                        || handles.contains(text)
+                        || attribute_owner_is_handle(&handles, text)
+                })
+                .unwrap_or(false),
+            // nc = netCDF4.Dataset(path)  /  var = nc.createVariable(...)
+            "call" => {
+                call_is_from(right, source, &file.imports, "netCDF4")
+                    || rhs.contains(".createVariable(")
+            }
+            // temps = nc.variables
+            "attribute" => rhs.ends_with(".variables"),
+            _ => false,
+        };
+
+        if is_handle {
+            handles.insert(node_text(&left, source).to_string());
+        }
+    }
+
+    handles
+}
+
+/// Is `text` an attribute chain rooted at a known netCDF4 handle
+/// (`nc.variables`, `ds.groups[...]`, …)?
+fn attribute_owner_is_handle(handles: &std::collections::HashSet<String>, text: &str) -> bool {
+    text.split('.')
+        .next()
+        .is_some_and(|root| handles.contains(root))
 }

@@ -1,10 +1,14 @@
+use std::sync::LazyLock;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Query, QueryCursor};
 
 use crate::{
     config::Config,
     diagnostic::{Diagnostic, RuleMeta, Severity},
-    parser::{ParsedFile, has_keyword_arg, is_inside_for_loop, node_text, position},
+    parser::{
+        ParsedFile, call_module, is_inside_loop, keyword_arg_present_or_unknown, node_text,
+        position,
+    },
 };
 
 use super::RuleSet;
@@ -12,6 +16,14 @@ use super::RuleSet;
 pub struct NumpyRules;
 
 const QUERY_SRC: &str = include_str!("../../queries/numpy.scm");
+
+/// Compiled once per process and shared across all rayon workers.
+/// `Query` is `Send + Sync`; only the `QueryCursor` needs to be per-call.
+/// A compilation failure is a bug in xray itself, so we fail loudly.
+static QUERY: LazyLock<Query> = LazyLock::new(|| {
+    Query::new(&tree_sitter_python::LANGUAGE.into(), QUERY_SRC)
+        .unwrap_or_else(|e| panic!("xray: BUG — failed to compile numpy query: {e}"))
+});
 
 impl RuleSet for NumpyRules {
     fn meta() -> Vec<RuleMeta> {
@@ -64,16 +76,12 @@ impl RuleSet for NumpyRules {
     fn check(file: &ParsedFile, path: &str, config: &Config) -> Vec<Diagnostic> {
         let mut diags = Vec::new();
         let source = file.source.as_bytes();
-        let lang = tree_sitter_python::LANGUAGE.into();
-
-        // Query compilation errors are a bug in xray itself — fail loudly.
-        let query = Query::new(&lang, QUERY_SRC)
-            .unwrap_or_else(|e| panic!("xray: BUG — failed to compile numpy query: {e}"));
+        let query = &*QUERY;
 
         let mut cursor = QueryCursor::new();
         let root = file.tree.root_node();
 
-        let mut matches = cursor.matches(&query, root, source);
+        let mut matches = cursor.matches(query, root, source);
         while let Some(m) = matches.next() {
             match m.pattern_index {
                 // NP001 — iterrows
@@ -104,19 +112,17 @@ impl RuleSet for NumpyRules {
                         .capture_index_for_name("np_concat_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        if !is_inside_for_loop(node) {
+                        if !is_inside_loop(node) {
                             continue;
                         }
-                        // Only fire for pd/np/numpy/pandas calls, not xr.concat etc.
-                        if let Some(func) = node.child_by_field_name("function") {
-                            if func.kind() == "attribute" {
-                                if let Some(obj) = func.child_by_field_name("object") {
-                                    let obj_name = node_text(&obj, source);
-                                    if !matches!(obj_name, "pd" | "np" | "numpy" | "pandas") {
-                                        continue;
-                                    }
-                                }
-                            }
+                        // Only fire for numpy/pandas calls, not xr.concat etc.
+                        // Resolved through import aliases so `import pandas as
+                        // pandas_lib` works and `df.concat(...)` does not match.
+                        if !matches!(
+                            call_module(node, source, &file.imports),
+                            Some("numpy") | Some("pandas")
+                        ) {
+                            continue;
                         }
                         let (line, col) = position(&node);
                         let fn_name = query
@@ -169,18 +175,11 @@ impl RuleSet for NumpyRules {
                         if !matches!(fn_name_raw, "zeros" | "ones" | "empty" | "full") {
                             continue;
                         }
-                        // Only fire for np/numpy calls, not da.ones() etc.
-                        if let Some(func) = call_node.child_by_field_name("function") {
-                            if func.kind() == "attribute" {
-                                if let Some(obj) = func.child_by_field_name("object") {
-                                    let obj_name = node_text(&obj, source);
-                                    if obj_name != "np" && obj_name != "numpy" {
-                                        continue;
-                                    }
-                                }
-                            }
+                        // Only fire for numpy calls, not da.ones() etc.
+                        if call_module(call_node, source, &file.imports) != Some("numpy") {
+                            continue;
                         }
-                        if !has_keyword_arg(call_node, source, "dtype") {
+                        if !keyword_arg_present_or_unknown(call_node, source, "dtype") {
                             let (line, col) = position(&call_node);
                             let fn_name = query
                                 .capture_index_for_name("np_alloc_method")
@@ -222,7 +221,7 @@ impl RuleSet for NumpyRules {
                             .and_then(|i| m.nodes_for_capture_index(i).next())
                             .map(|n| node_text(&n, source))
                             .unwrap_or("fn");
-                        let in_loop = is_inside_for_loop(node);
+                        let in_loop = is_inside_loop(node);
                         let (severity, message) = if in_loop {
                             (
                                 Severity::Warning,
@@ -253,6 +252,13 @@ impl RuleSet for NumpyRules {
                         .capture_index_for_name("np_chained_index")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
+                        // The query matches any `a[..][..]`, which flagged
+                        // `grid[0][1]` on a list of lists.  Chained *indexing*
+                        // in the pandas sense selects a column by name first,
+                        // so require the inner subscript to use a string key.
+                        if !inner_subscript_is_string_key(node, source) {
+                            continue;
+                        }
                         let (line, col) = position(&node);
                         diags.push(
                             Diagnostic::new(
@@ -275,21 +281,9 @@ impl RuleSet for NumpyRules {
                         .capture_index_for_name("np_matrix_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
-                        // Only fire for np.matrix / numpy.matrix — not any .matrix() call
-                        if let Some(func) = node.child_by_field_name("function") {
-                            if func.kind() == "attribute" {
-                                if let Some(obj) = func.child_by_field_name("object") {
-                                    let obj_name = node_text(&obj, source);
-                                    if obj_name != "np" && obj_name != "numpy" {
-                                        continue;
-                                    }
-                                } else {
-                                    continue;
-                                }
-                            } else {
-                                // bare matrix(...) — skip (too ambiguous without import check)
-                                continue;
-                            }
+                        // Only fire for numpy's matrix(), resolved through aliases.
+                        if call_module(node, source, &file.imports) != Some("numpy") {
+                            continue;
                         }
                         let (line, col) = position(&node);
                         diags.push(
@@ -359,4 +353,22 @@ impl RuleSet for NumpyRules {
 
         diags
     }
+}
+
+/// Does the inner subscript of `df["col"][row]` select by string key?
+///
+/// This is what distinguishes pandas column-then-row chained indexing (which
+/// returns a copy, so assignments silently do not propagate) from ordinary
+/// nested indexing on a list or ndarray.
+fn inner_subscript_is_string_key(outer: tree_sitter::Node<'_>, _source: &[u8]) -> bool {
+    let Some(inner) = outer.child_by_field_name("value") else {
+        return false;
+    };
+    if inner.kind() != "subscript" {
+        return false;
+    }
+    let Some(subscript) = inner.child_by_field_name("subscript") else {
+        return false;
+    };
+    matches!(subscript.kind(), "string" | "concatenated_string")
 }

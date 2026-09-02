@@ -1,14 +1,15 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
+use serde::Deserialize;
 use std::path::PathBuf;
 
 /// HPC scientific Python linter — xarray, dask, NumPy, IO.
 ///
 /// Exit codes:
-///   0  — no diagnostics at or above --min-severity
-///   1  — one or more diagnostics found
+///   0  — no diagnostics at or above --fail-on
+///   1  — one or more diagnostics at or above --fail-on (default: error)
 ///   2  — internal error (parse failure, I/O error, bug)
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "xray", version, about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
@@ -28,8 +29,11 @@ pub struct Cli {
     pub format: OutputFormat,
 
     /// Minimum severity to report  [env: XRAY_MIN_SEVERITY]
-    #[arg(long, short = 's', default_value = "hint", env = "XRAY_MIN_SEVERITY")]
-    pub min_severity: MinSeverity,
+    ///
+    /// Takes precedence over `min_severity` in xray.toml.  When neither is
+    /// set, every severity is reported.
+    #[arg(long, short = 's', env = "XRAY_MIN_SEVERITY")]
+    pub min_severity: Option<MinSeverity>,
 
     /// List all available rules and exit
     #[arg(long)]
@@ -42,6 +46,14 @@ pub struct Cli {
     /// Print a per-rule and per-file summary table after linting
     #[arg(long)]
     pub stats: bool,
+
+    /// Lowest severity that makes xray exit non-zero  [env: XRAY_FAIL_ON]
+    ///
+    /// Diagnostics are still reported regardless; this only controls the exit
+    /// code.  `never` always exits 0.  Defaults to `error`, so a file with
+    /// only warnings exits 0 unless you ask otherwise.
+    #[arg(long, default_value = "error", env = "XRAY_FAIL_ON")]
+    pub fail_on: FailOn,
 
     /// Only lint Python files changed relative to a git ref
     ///
@@ -67,7 +79,7 @@ pub struct Cli {
     pub watch: bool,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 pub enum XrayCommand {
     /// Show detailed rationale, bad/good examples, and docs for a rule
     Explain {
@@ -117,8 +129,21 @@ pub enum OutputFormat {
     GitlabCodequality,
 }
 
-#[derive(ValueEnum, Clone, Debug, PartialEq, PartialOrd)]
+/// Lowest severity that should make the process exit non-zero.
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FailOn {
+    Hint,
+    Warning,
+    #[default]
+    Error,
+    /// Never fail, whatever is found.
+    Never,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, PartialOrd, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MinSeverity {
+    #[default]
     Hint,
     Warning,
     Error,

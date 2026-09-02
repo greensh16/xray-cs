@@ -26,7 +26,14 @@ impl std::fmt::Display for Severity {
 pub struct Diagnostic {
     pub rule_id: &'static str,
     pub severity: Severity,
+    /// Real on-disk path.  For notebooks this stays the `.ipynb` path so that
+    /// SARIF and GitLab consumers get a location they can resolve; the cell is
+    /// reported separately in `cell`.
     pub file: String,
+    /// 1-based index of the notebook code cell this diagnostic came from,
+    /// counting code cells only.  `None` for plain Python files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cell: Option<usize>,
     /// 1-based line number
     pub line: usize,
     /// 1-based column
@@ -58,6 +65,7 @@ impl Diagnostic {
             rule_id,
             severity,
             file: file.into(),
+            cell: None,
             line,
             column,
             message: message.into(),
@@ -82,6 +90,21 @@ impl Diagnostic {
         self.url = Some(url);
         self
     }
+
+    /// Record which notebook cell produced this diagnostic.
+    pub fn in_cell(mut self, path: &str, cell: usize) -> Self {
+        self.file = path.to_string();
+        self.cell = Some(cell);
+        self
+    }
+
+    /// How the location should be shown to a human: `nb.ipynb:cell[3]:12`.
+    pub fn display_location(&self) -> String {
+        match self.cell {
+            Some(cell) => format!("{}:cell[{}]:{}", self.file, cell, self.line),
+            None => format!("{}:{}", self.file, self.line),
+        }
+    }
 }
 
 /// Static metadata about a rule — used for --list-rules and xray explain
@@ -95,6 +118,11 @@ pub struct RuleMeta {
 /// All results for a single file
 #[derive(Default)]
 pub struct FileResults {
+    /// The path that produced these diagnostics.  Kept alongside the
+    /// diagnostics so reporting never has to assume a parallel path vector —
+    /// files that fail to parse are dropped, which used to shift every
+    /// subsequent row in `--stats`.
+    pub path: String,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -107,8 +135,9 @@ impl FileResults {
 /// Aggregated results across the whole run
 #[derive(Default)]
 pub struct RunResults {
+    /// One entry per file that was successfully parsed and linted.
     pub files: Vec<FileResults>,
-    /// Paths that were linted (parallel to `files`)
+    /// Every path xray attempted, including ones that failed to parse.
     pub paths: Vec<String>,
 }
 
@@ -117,6 +146,18 @@ impl RunResults {
         self.files
             .iter()
             .any(|f| f.diagnostics.iter().any(|d| d.severity == Severity::Error))
+    }
+
+    /// Should the process exit non-zero, given the `--fail-on` threshold?
+    pub fn should_fail(&self, fail_on: crate::cli::FailOn) -> bool {
+        use crate::cli::FailOn;
+        let min = match fail_on {
+            FailOn::Never => return false,
+            FailOn::Hint => Severity::Hint,
+            FailOn::Warning => Severity::Warning,
+            FailOn::Error => Severity::Error,
+        };
+        self.all_diagnostics().any(|d| d.severity >= min)
     }
 
     pub fn all_diagnostics(&self) -> impl Iterator<Item = &Diagnostic> {
