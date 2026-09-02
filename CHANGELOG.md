@@ -9,6 +9,97 @@ xray uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Receiver tracking (`src/bindings.rs`).** xray now records what each name was
+  assigned from within its enclosing function — `ds = xr.open_dataset(...)`,
+  `df = pd.read_csv(...)` — so rules can check a receiver's library instead of
+  inferring it from a method name. Scopes reset at every function boundary,
+  parameters stay unknown, and a name rebound from a conflicting origin degrades
+  to unknown rather than guessing. There is no interprocedural analysis.
+
+  Rules treat "unknown" as *keep the previous behaviour*, so this only removes
+  false positives; it never trades them for false negatives. Costs about 13%
+  more CPU per file (0.55 s → 0.62 s over 500 files) with no change in wall time.
+
+- **DK004 no longer flags reduce-then-compute.** `ds.mean().compute()` and
+  `ds.sel(...).compute()` are the correct dask idiom — the graph ran a parallel
+  reduction and `.compute()` retrieves the small result. The rule now fires only
+  when a dask object is constructed or loaded and materialised in the same
+  expression (`da.from_array(x).compute()`, `dd.read_csv(f).compute()`), which is
+  what its own documentation and `xray explain DK004` always described.
+
+- **NP004 no longer hints on genuine scalars.** Outside a loop the rule fires
+  only when its argument is known to be an array. On a single float `math.sqrt`
+  is *faster* than the NumPy ufunc, which pays array-dispatch overhead for one
+  value, so the hint previously pointed the wrong way. Inside a loop the warning
+  is unchanged — there the iteration itself is the problem.
+
+- **NP003 describes `np.full` correctly.** `np.full(shape, 0)` infers `int64`
+  from the fill value; it does not default to `float64` like `zeros`, `ones` and
+  `empty`. The message now says so.
+
+### Packaging
+
+- **Linux release binaries are now statically linked against musl.**
+  `release.yml` builds `x86_64-unknown-linux-musl` and
+  `aarch64-unknown-linux-musl` via `cross`, so the published binaries run on HPC
+  login nodes and older distros regardless of host glibc — a gnu-linked binary
+  built on ubuntu-22.04 requires glibc 2.35+, excluding RHEL/CentOS 7-8 and
+  SLES 12. Artifact names are unchanged, so the GitHub Action and the documented
+  `curl` install commands keep working.
+
+### Tests
+
+- **Unit tests in every rule module**, which `CONTRIBUTING.md` has always required
+  and none of them had: 44 tests covering all 33 rule IDs, each pairing a
+  fires-case with the nearest legitimate lookalike that must stay silent, plus
+  coverage of the four config knobs rules actually read. They call
+  `RuleSet::check` directly rather than `rules::run_all`, so a failure points at
+  one rule set instead of a shared fixture.
+- `CONTRIBUTING.md`'s unit-test example called a per-rule `check_xr008(&parsed)`
+  helper that has never existed; it now shows the real API.
+
+### Fixed
+
+- **XR002 no longer fires on non-xarray receivers.** `df.values` on a DataFrame
+  is the documented pandas idiom, and `.values` on a NumPy array or plain
+  container has nothing to do with xarray. A receiver whose origin cannot be
+  determined — a function parameter, say — is still flagged.
+
+- **NP007b missed `.apply(lambda ...)` whose result was assigned.** The rule
+  expressed loop context in the query via `(_)* … (_)*`, which only matched
+  direct `expression_statement` children of the loop body, so
+  `df[col] = df[col].apply(lambda x: ...)` — the exact example in the rule's own
+  documentation — was never reported. That construct could also match at several
+  split points and emit duplicate diagnostics for one call. Loop context now uses
+  `is_inside_loop`, as every other loop-sensitive rule does.
+
+- **Suppression comments inside strings and docstrings no longer suppress
+  anything.** Suppressions are now collected from the AST's `comment` nodes
+  instead of by scanning raw lines for `# xray:`, so a docstring demonstrating
+  how to silence a rule stopped silencing it for real — a `disable-file=` in a
+  docstring previously took out the whole file.
+
+- **Inline suppression rule IDs are case-insensitive.** `# xray: disable=xr001`
+  now works, matching `--disable` and `xray.toml`, which have accepted lowercase
+  since 1.0.1.
+
+- **CRLF files no longer render misplaced diagnostic markers.** `render_text`
+  normalises line endings exactly as the parser does; previously every ariadne
+  label drifted by one character per preceding line.
+
+- **`CONTRIBUTING.md`'s architecture and rule-authoring sections were fiction.**
+  They described inline query strings, per-rule `check_<id>()` functions, a
+  `parsed.path` field, a `.with_fix()` builder and an `ExplainEntry` shape — none
+  of which exist. A contributor following them would have failed at every step.
+  Rewritten against the real codebase.
+
+- **`docs/rules/dask.md` documented a rule DK004 does not implement** (it
+  described `dask.compute()` with a single argument), and `docs/rules/numpy.md`
+  described NP003 as flagging `np.array` rather than the allocators it actually
+  checks. Both sections rewritten.
+
 ---
 
 ## [1.0.1] — 2026-09-02

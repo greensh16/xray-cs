@@ -82,23 +82,21 @@
 ) @np_applymap_call
 
 
-; NP007b — DataFrame/Series .apply(lambda ...) inside a for loop.
+; NP007b — DataFrame/Series .apply(lambda ...) inside a loop.
 ; Applying a Python lambda row-by-row or element-by-element inside a loop
 ; is extremely slow — vectorise the operation or use .map() / .apply() once.
-(for_statement
-  body: (block
-    (_)*
-    (expression_statement
-      (call
-        function: (attribute
-          attribute: (identifier) @np_apply_method
-          (#eq? @np_apply_method "apply")
-        )
-        arguments: (argument_list
-          (lambda) @np_apply_lambda
-        )
-      ) @np_apply_in_loop
-    )
-    (_)*
+;
+; Loop context is decided in Rust via `is_inside_loop`, as with every other
+; loop-sensitive rule. The previous `(_)* ... (_)*` shape could match at
+; several split points (emitting duplicate diagnostics for one call) and only
+; saw direct `expression_statement` children of the body, so an assigned
+; result — `x = df.apply(lambda ...)` — was missed entirely.
+(call
+  function: (attribute
+    attribute: (identifier) @np_apply_method
+    (#eq? @np_apply_method "apply")
   )
-)
+  arguments: (argument_list
+    (lambda) @np_apply_lambda
+  )
+) @np_apply_in_loop

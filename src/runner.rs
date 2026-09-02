@@ -220,7 +220,15 @@ fn render_text(results: &RunResults, _paths: &[String]) {
         } else {
             cache
                 .entry(diag.file.as_str())
-                .or_insert_with(|| std::fs::read_to_string(&diag.file).unwrap_or_default())
+                .or_insert_with(|| {
+                    // Normalise CRLF exactly as `parser::parse_source` does.
+                    // Diagnostic columns are byte offsets into the normalised
+                    // source; rendering against the raw file drifted every
+                    // ariadne label by one char per preceding line.
+                    std::fs::read_to_string(&diag.file)
+                        .unwrap_or_default()
+                        .replace("\r\n", "\n")
+                })
                 .clone()
         };
 

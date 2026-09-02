@@ -5,12 +5,40 @@ use tree_sitter::{Query, QueryCursor};
 use crate::{
     config::Config,
     diagnostic::{Diagnostic, RuleMeta, Severity},
-    parser::{ParsedFile, call_is_from, is_inside_loop, keyword_arg_present_or_unknown, position},
+    parser::{
+        ParsedFile, call_is_from, is_inside_loop, keyword_arg_present_or_unknown, node_text,
+        position,
+    },
 };
 
 use super::RuleSet;
 
 pub struct DaskRules;
+
+/// Constructors and loaders whose result being `.compute()`d on the spot means
+/// the dask graph never bought anything — the data is read, wrapped, and
+/// immediately materialised.
+///
+/// Reductions and selections (`mean`, `sum`, `sel`, …) are deliberately absent:
+/// `ds.mean().compute()` is the correct idiom, not a mistake.
+const POINTLESS_BEFORE_COMPUTE: &[&str] = &[
+    "from_array",
+    "from_delayed",
+    "from_pandas",
+    "from_zarr",
+    "from_npy_stack",
+    "read_csv",
+    "read_parquet",
+    "read_hdf",
+    "read_orc",
+    "read_json",
+    "read_sql",
+    "open_dataset",
+    "open_mfdataset",
+    "open_zarr",
+    "asarray",
+    "array",
+];
 
 const QUERY_SRC: &str = include_str!("../../queries/dask.scm");
 
@@ -47,7 +75,7 @@ impl RuleSet for DaskRules {
                 id: "DK004",
                 name: "immediate-compute",
                 severity: Severity::Hint,
-                description: "Dask operation immediately followed by .compute() — no lazy benefit, use pandas/numpy directly",
+                description: "Dask object constructed and immediately .compute()d — the graph never did any work, use pandas/numpy directly",
             },
             RuleMeta {
                 id: "DK005",
@@ -164,6 +192,20 @@ impl RuleSet for DaskRules {
                         .capture_index_for_name("dk_immediate_compute_call")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
+                        // `ds.mean().compute()` is the idiomatic way to run a
+                        // reduction: dask did the parallel work, and computing
+                        // the small result is the whole point. The genuinely
+                        // pointless case is building a dask object and
+                        // materialising it immediately — `da.from_array(x).compute()`
+                        // — where the graph never did anything for you.
+                        let inner = query
+                            .capture_index_for_name("dk_inner_method")
+                            .and_then(|i| m.nodes_for_capture_index(i).next())
+                            .map(|n| node_text(&n, source))
+                            .unwrap_or("");
+                        if !POINTLESS_BEFORE_COMPUTE.contains(&inner) {
+                            continue;
+                        }
                         let (line, col) = position(&node);
                         diags.push(
                             Diagnostic::new(
@@ -172,7 +214,7 @@ impl RuleSet for DaskRules {
                                 path,
                                 line,
                                 col,
-                                "Dask operation immediately followed by `.compute()` — the lazy graph is never reused",
+                                "Dask object constructed and immediately `.compute()`d — the task graph never did any work",
                             )
                             .with_suggestion("If you never reuse this result lazily, consider using pandas/numpy directly")
                             .with_url("https://docs.dask.org/en/stable/best-practices.html#avoid-calling-compute-repeatedly"),
@@ -342,5 +384,156 @@ impl RuleSet for DaskRules {
         }
 
         diags
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse_source;
+
+    /// Rule IDs fired by `src`, in line order. Calls `DaskRules::check`
+    /// directly, so `run_all`'s cross-domain redundancy filter (which collapses
+    /// DK001/DK002 against XR005) is deliberately not in the way.
+    fn ids(src: &str) -> Vec<&'static str> {
+        let parsed = parse_source(src.to_string()).unwrap();
+        let mut diags = DaskRules::check(&parsed, "<test>", &Config::default());
+        diags.sort_by_key(|d| (d.line, d.rule_id));
+        diags.into_iter().map(|d| d.rule_id).collect()
+    }
+
+    fn fires(rule: &'static str, src: &str) -> bool {
+        ids(src).contains(&rule)
+    }
+
+    const IMPORTS: &str = "import dask\nimport dask.array as da\n";
+
+    #[test]
+    fn dk001_compute_in_for_loop() {
+        assert!(fires(
+            "DK001",
+            &format!("{IMPORTS}for p in parts:\n    x = arr.compute()\n")
+        ));
+        assert!(!fires("DK001", &format!("{IMPORTS}x = arr.compute()\n")));
+    }
+
+    #[test]
+    fn dk002_dask_compute_in_for_loop() {
+        assert!(fires(
+            "DK002",
+            &format!("{IMPORTS}for p in parts:\n    dask.compute(p)\n")
+        ));
+        assert!(!fires("DK002", &format!("{IMPORTS}dask.compute(a, b)\n")));
+    }
+
+    #[test]
+    fn dk003_fires_only_above_the_threshold() {
+        // Default threshold is 3: three calls sits at the limit, four exceeds
+        // it. The rule reads "more than N", matching how the config key and
+        // `xray init`'s template describe it.
+        let at_limit = format!("{IMPORTS}{}", "x = arr.compute()\n".repeat(3));
+        let over = format!("{IMPORTS}{}", "x = arr.compute()\n".repeat(4));
+        assert!(!fires("DK003", &at_limit));
+        assert!(fires("DK003", &over));
+    }
+
+    #[test]
+    fn dk003_threshold_is_configurable() {
+        let src = format!("{IMPORTS}{}", "x = arr.compute()\n".repeat(3));
+        let parsed = parse_source(src).unwrap();
+        let mut config = Config::default();
+        config.dask.compute_call_threshold = 2;
+        let diags = DaskRules::check(&parsed, "<test>", &config);
+        assert!(diags.iter().any(|d| d.rule_id == "DK003"));
+    }
+
+    #[test]
+    fn dk004_construct_then_compute_but_not_reduce_then_compute() {
+        // The graph never did any work: wrap and immediately materialise.
+        assert!(fires(
+            "DK004",
+            &format!("{IMPORTS}x = da.from_array(v).compute()\n")
+        ));
+        // Idiomatic: dask ran a parallel reduction, .compute() fetches the
+        // small result. Flagging this was DK004's most common false positive.
+        assert!(!fires(
+            "DK004",
+            &format!("{IMPORTS}x = ds.mean().compute()\n")
+        ));
+        assert!(!fires(
+            "DK004",
+            &format!("{IMPORTS}x = ds.sel(t=0).compute()\n")
+        ));
+    }
+
+    #[test]
+    fn dk005_persist_result_discarded() {
+        assert!(fires("DK005", &format!("{IMPORTS}arr.persist()\n")));
+        assert!(!fires("DK005", &format!("{IMPORTS}kept = arr.persist()\n")));
+    }
+
+    #[test]
+    fn dk006_persist_then_compute() {
+        assert!(fires(
+            "DK006",
+            &format!("{IMPORTS}x = arr.persist().compute()\n")
+        ));
+    }
+
+    #[test]
+    fn dk007_from_array_without_chunks_resolves_aliases() {
+        assert!(fires("DK007", &format!("{IMPORTS}x = da.from_array(v)\n")));
+        assert!(!fires(
+            "DK007",
+            &format!("{IMPORTS}x = da.from_array(v, chunks=10)\n")
+        ));
+        // An unconventional alias must still resolve to dask.
+        assert!(fires(
+            "DK007",
+            "import dask.array as dsa\nx = dsa.from_array(v)\n"
+        ));
+        // A same-named method on an unrelated object must not.
+        assert!(!fires(
+            "DK007",
+            &format!("{IMPORTS}x = helper.from_array(v)\n")
+        ));
+    }
+
+    #[test]
+    fn dk008_rechunk_in_loop() {
+        assert!(fires(
+            "DK008",
+            &format!("{IMPORTS}for p in parts:\n    arr.rechunk(p)\n")
+        ));
+        assert!(!fires("DK008", &format!("{IMPORTS}arr.rechunk(100)\n")));
+    }
+
+    #[test]
+    fn dk009_concatenate_in_loop_is_dask_only() {
+        assert!(fires(
+            "DK009",
+            &format!("{IMPORTS}for p in parts:\n    out = da.concatenate([out, p])\n")
+        ));
+        assert!(!fires(
+            "DK009",
+            &format!("{IMPORTS}out = da.concatenate(items)\n")
+        ));
+    }
+
+    #[test]
+    fn loop_context_covers_while_and_comprehensions_but_not_the_header() {
+        assert!(fires(
+            "DK001",
+            &format!("{IMPORTS}while more:\n    x = arr.compute()\n")
+        ));
+        assert!(fires(
+            "DK001",
+            &format!("{IMPORTS}vals = [a.compute() for a in arrays]\n")
+        ));
+        // The call in a loop *header* runs once, not once per iteration.
+        assert!(!fires(
+            "DK001",
+            &format!("{IMPORTS}for row in arr.compute():\n    pass\n")
+        ));
     }
 }

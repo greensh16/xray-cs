@@ -333,3 +333,126 @@ fn attribute_owner_is_handle(handles: &std::collections::HashSet<String>, text: 
         .next()
         .is_some_and(|root| handles.contains(root))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse_source;
+
+    /// Rule IDs fired by `src`, in line order.
+    fn ids(src: &str) -> Vec<&'static str> {
+        let parsed = parse_source(src.to_string()).unwrap();
+        let mut diags = IoRules::check(&parsed, "<test>", &Config::default());
+        diags.sort_by_key(|d| (d.line, d.rule_id));
+        diags.into_iter().map(|d| d.rule_id).collect()
+    }
+
+    fn fires(rule: &'static str, src: &str) -> bool {
+        ids(src).contains(&rule)
+    }
+
+    const IMPORTS: &str =
+        "import numpy as np\nimport netCDF4\nimport zarr\nimport h5py\nimport xarray as xr\n";
+
+    #[test]
+    fn io001_np_save_is_numpy_only() {
+        assert!(fires("IO001", &format!("{IMPORTS}np.save('a.npy', arr)\n")));
+        // A same-named method on an unrelated object must not fire.
+        assert!(!fires("IO001", &format!("{IMPORTS}model.save('a.pkl')\n")));
+    }
+
+    #[test]
+    fn io001_and_io002_respect_the_compression_toggle() {
+        let src = format!("{IMPORTS}np.save('a.npy', arr)\nds = netCDF4.Dataset('a.nc')\n");
+        let parsed = parse_source(src).unwrap();
+        let mut config = Config::default();
+        config.io.flag_missing_compression = false;
+        let diags = IoRules::check(&parsed, "<test>", &config);
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.rule_id != "IO001" && d.rule_id != "IO002")
+        );
+    }
+
+    #[test]
+    fn io002_netcdf4_direct_open() {
+        assert!(fires(
+            "IO002",
+            &format!("{IMPORTS}ds = netCDF4.Dataset('a.nc')\n")
+        ));
+    }
+
+    #[test]
+    fn io003_zarr_open_is_not_the_builtin_open() {
+        assert!(fires(
+            "IO003",
+            &format!("{IMPORTS}z = zarr.open('a.zarr')\n")
+        ));
+        // The builtin open() has nothing to do with zarr.
+        assert!(!fires("IO003", &format!("{IMPORTS}f = open('a.txt')\n")));
+        assert!(!fires(
+            "IO003",
+            &format!("{IMPORTS}z = zarr.open('a.zarr', chunks=(10,))\n")
+        ));
+    }
+
+    #[test]
+    fn io004_needs_a_netcdf_handle() {
+        // The handle is bound outside the loop and subscripted inside it —
+        // each read may hit disk on every iteration.
+        assert!(fires(
+            "IO004",
+            &format!(
+                "{IMPORTS}nc = netCDF4.Dataset('a.nc')\ntemp = nc.variables['t']\nfor i in r:\n    v = temp[i]\n"
+            )
+        ));
+        // Plain list and dict indexing inside a loop is not a netCDF read.
+        assert!(!fires(
+            "IO004",
+            &format!("{IMPORTS}rows = [1, 2]\nfor i in r:\n    v = rows[i]\n")
+        ));
+        assert!(!fires(
+            "IO004",
+            &format!("{IMPORTS}d = {{}}\nfor i in r:\n    v = d['k']\n")
+        ));
+    }
+
+    #[test]
+    fn io005_h5py_file_without_swmr() {
+        assert!(fires(
+            "IO005",
+            &format!("{IMPORTS}f = h5py.File('a.h5', 'r')\n")
+        ));
+        assert!(!fires(
+            "IO005",
+            &format!("{IMPORTS}f = h5py.File('a.h5', 'r', swmr=True)\n")
+        ));
+        // **kwargs may carry swmr, so the rule cannot claim it is absent.
+        assert!(!fires(
+            "IO005",
+            &format!("{IMPORTS}f = h5py.File('a.h5', 'r', **opts)\n")
+        ));
+    }
+
+    #[test]
+    fn io006_scipy_engine() {
+        assert!(fires(
+            "IO006",
+            &format!("{IMPORTS}ds = xr.open_dataset('a.nc', engine='scipy')\n")
+        ));
+        assert!(!fires(
+            "IO006",
+            &format!("{IMPORTS}ds = xr.open_dataset('a.nc', engine='netcdf4')\n")
+        ));
+    }
+
+    #[test]
+    fn disabled_rules_do_not_fire() {
+        let parsed = parse_source(format!("{IMPORTS}np.save('a.npy', arr)\n")).unwrap();
+        let mut config = Config::default();
+        config.disable.insert("IO001".to_string());
+        let diags = IoRules::check(&parsed, "<test>", &config);
+        assert!(diags.iter().all(|d| d.rule_id != "IO001"));
+    }
+}

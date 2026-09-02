@@ -1,3 +1,4 @@
+use crate::bindings::Bindings;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Parser, Tree};
@@ -8,6 +9,9 @@ pub struct ParsedFile {
     pub tree: Tree,
     pub imports: ImportContext,
     pub suppressions: Suppressions,
+    /// What each name in each scope was assigned from — lets rules check a
+    /// receiver's library instead of guessing from its method name.
+    pub bindings: Bindings,
 }
 
 /// Which scientific libraries are imported in this file — used to
@@ -169,39 +173,56 @@ impl Suppressions {
                 .is_some_and(|s| s.contains(rule_id))
     }
 
-    fn from_source(source: &str) -> Self {
+    /// Collect suppressions from the file's **comment nodes**.
+    ///
+    /// Scanning raw lines for `# xray:` also matched the text inside string
+    /// literals and docstrings, so a documentation example showing how to
+    /// suppress a rule silenced that rule for real code — a
+    /// `disable-file=` inside a docstring took out the whole file.
+    fn from_tree(root: Node<'_>, source: &[u8]) -> Self {
         let mut s = Suppressions::default();
-        for (i, line) in source.lines().enumerate() {
-            let line_num = i + 1;
-            // Look for `# xray:` anywhere on the line (allows inline comments)
-            if let Some(pos) = line.find("# xray:") {
-                let after = line[pos + 7..].trim_start(); // text after "# xray:"
-                if let Some(rules_str) = after.strip_prefix("disable-file=") {
-                    // File-wide: # xray: disable-file=XR001,XR002
-                    for rule in rules_str
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                    {
-                        s.file_level.insert(rule.to_string());
-                    }
-                } else if let Some(rules_str) = after.strip_prefix("disable=") {
-                    // Line-level: # xray: disable=XR001
-                    for rule in rules_str
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                    {
-                        s.line_level
-                            .entry(line_num)
-                            .or_default()
-                            .insert(rule.to_string());
-                    }
+        let mut stack = vec![root];
+
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+            if node.kind() != "comment" {
+                continue;
+            }
+            let text = node_text(&node, source);
+            let Some(pos) = text.find("# xray:") else {
+                continue;
+            };
+            let line_num = node.start_position().row + 1;
+            let after = text[pos + 7..].trim_start();
+
+            if let Some(rules_str) = after.strip_prefix("disable-file=") {
+                // File-wide: # xray: disable-file=XR001,XR002
+                for rule in split_rule_ids(rules_str) {
+                    s.file_level.insert(rule);
+                }
+            } else if let Some(rules_str) = after.strip_prefix("disable=") {
+                // Line-level: # xray: disable=XR001
+                for rule in split_rule_ids(rules_str) {
+                    s.line_level.entry(line_num).or_default().insert(rule);
                 }
             }
         }
         s
     }
+}
+
+/// Split a comma-separated rule list, upper-casing each ID.
+///
+/// Rule IDs are case-insensitive in `--disable` and in `xray.toml`; inline
+/// suppressions follow the same rule so `# xray: disable=xr001` works.
+fn split_rule_ids(list: &str) -> impl Iterator<Item = String> + '_ {
+    list.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_uppercase())
 }
 
 pub fn parse_file(path: &str) -> Result<ParsedFile> {
@@ -228,13 +249,15 @@ pub fn parse_source(source: String) -> Result<ParsedFile> {
         .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to produce a parse tree"))?;
 
     let imports = ImportContext::from_tree(tree.root_node(), source.as_bytes());
-    let suppressions = Suppressions::from_source(&source);
+    let suppressions = Suppressions::from_tree(tree.root_node(), source.as_bytes());
+    let bindings = Bindings::build(tree.root_node(), source.as_bytes(), &imports);
 
     Ok(ParsedFile {
         source,
         tree,
         imports,
         suppressions,
+        bindings,
     })
 }
 
@@ -412,4 +435,87 @@ pub fn keyword_arg_value<'a>(call_node: Node<'_>, source: &'a [u8], kw: &str) ->
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn suppressions(src: &str) -> Suppressions {
+        parse_source(src.to_string()).unwrap().suppressions
+    }
+
+    #[test]
+    fn line_suppression_applies_to_its_own_line() {
+        let s = suppressions(
+            "import xarray as xr\nds = xr.open_dataset('a.nc')  # xray: disable=XR001\n",
+        );
+        assert!(s.is_suppressed("XR001", 2));
+        assert!(!s.is_suppressed("XR001", 1));
+        assert!(!s.is_suppressed("XR002", 2));
+    }
+
+    #[test]
+    fn file_suppression_applies_everywhere() {
+        let s = suppressions("# xray: disable-file=XR001\nimport xarray as xr\n");
+        assert!(s.is_suppressed("XR001", 1));
+        assert!(s.is_suppressed("XR001", 99));
+    }
+
+    #[test]
+    fn rule_ids_are_case_insensitive() {
+        // `--disable xr001` and `disable = ["xr001"]` both work; inline
+        // suppressions must not be the one place that is case-sensitive.
+        let s = suppressions(
+            "import xarray as xr\nds = xr.open_dataset('a.nc')  # xray: disable=xr001\n",
+        );
+        assert!(s.is_suppressed("XR001", 2));
+    }
+
+    #[test]
+    fn comma_separated_ids_all_register() {
+        let s = suppressions("x = 1  # xray: disable=XR001,XR002 , np004\n");
+        assert!(s.is_suppressed("XR001", 1));
+        assert!(s.is_suppressed("XR002", 1));
+        assert!(s.is_suppressed("NP004", 1));
+    }
+
+    #[test]
+    fn suppressions_inside_a_docstring_are_ignored() {
+        // A docstring showing users how to suppress a rule must not actually
+        // suppress it — `disable-file=` in a docstring silenced whole files.
+        let s = suppressions(
+            "import xarray as xr\n\
+             def helper():\n\
+             \x20   \"\"\"\n\
+             \x20   Example:\n\
+             \x20       ds = xr.open_dataset('a.nc')  # xray: disable-file=XR001\n\
+             \x20   \"\"\"\n\
+             \x20   return None\n",
+        );
+        assert!(
+            !s.is_suppressed("XR001", 5),
+            "text inside a docstring must not suppress anything"
+        );
+        assert!(s.file_level.is_empty());
+    }
+
+    #[test]
+    fn suppressions_inside_a_string_literal_are_ignored() {
+        let s = suppressions("msg = \"# xray: disable-file=XR001\"\n");
+        assert!(s.file_level.is_empty());
+    }
+
+    #[test]
+    fn trailing_comment_after_code_still_counts() {
+        // The comment is a real comment node, just not at the start of a line.
+        let s = suppressions("x = compute()  # xray: disable=DK001\n");
+        assert!(s.is_suppressed("DK001", 1));
+    }
+
+    #[test]
+    fn crlf_sources_keep_their_line_numbers() {
+        let s = suppressions("import xarray as xr\r\nx = 1  # xray: disable=XR001\r\n");
+        assert!(s.is_suppressed("XR001", 2));
+    }
 }

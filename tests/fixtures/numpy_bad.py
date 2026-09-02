@@ -43,8 +43,9 @@ for val in arr:
 val = df["a"][0]                        # copy semantics, assignment won't propagate
 df["a"][5] = 99                         # silently writes to a copy, not the DataFrame
 
-# NP004: math.* outside a loop — hint level (no per-element looping, but still scalar)
-single_sqrt = math.sqrt(2.0)           # replace with np.sqrt(2.0) or just np.sqrt(arr)
+# NP004: math.* applied to an array outside a loop — hint level.
+# math.sqrt on a whole array is the case worth flagging: np.sqrt vectorises it.
+array_sqrt = math.sqrt(arr)            # replace with np.sqrt(arr)
 
 # NP006: np.matrix() is deprecated since NumPy 1.16
 mat = np.matrix([[1, 2], [3, 4]])

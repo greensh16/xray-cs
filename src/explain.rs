@@ -350,7 +350,12 @@ r1, r2, r3 = dask.compute(a_hot.sum(), a_hot.mean(), a_hot.std())",
         rationale: "\
 Constructing a dask array and immediately calling .compute() on it in the
 same expression means the lazy graph is never reused.  The overhead of
-building the task graph outweighs any benefit — use NumPy/pandas directly.",
+building the task graph outweighs any benefit — use NumPy/pandas directly.
+
+Only constructors and loaders count: from_array, from_delayed, from_pandas,
+read_csv, open_dataset and friends.  A reduction such as ds.mean().compute()
+is the correct idiom — dask performed the parallel work and .compute() simply
+retrieves the small result — so it is not flagged.",
         bad_example: "\
 result = da.from_array(np.arange(1000), chunks=100).compute()  # never lazy",
         good_example: "\
@@ -503,15 +508,22 @@ result = pd.concat(frames)   # single allocation",
         severity: "hint",
         domain: "numpy/pandas",
         rationale: "\
-np.zeros, np.ones, np.empty, and np.full default to float64 when dtype= is
-omitted.  On HPC systems processing integer data this silently doubles the
-memory footprint and halves SIMD throughput.",
+np.zeros, np.ones and np.empty default to float64 when dtype= is omitted.
+On HPC systems processing integer data this silently doubles the memory
+footprint and halves SIMD throughput.
+
+np.full is the exception: it infers the dtype from the fill value, so
+np.full(shape, 0) is int64 and np.full(shape, 0.0) is float64.  Being explicit
+still matters — the inferred type follows a literal that is easy to change
+without noticing the dtype change that follows it.",
         bad_example: "\
 grid = np.zeros((1024, 1024))     # silently float64 — 8 MB per array
-mask = np.ones((512, 512))        # same",
+mask = np.ones((512, 512))        # same
+fill = np.full((512, 512), 0)     # int64, inferred from the literal 0",
         good_example: "\
 grid = np.zeros((1024, 1024), dtype=np.float32)
-mask = np.ones((512, 512), dtype=np.int8)",
+mask = np.ones((512, 512), dtype=np.int8)
+fill = np.full((512, 512), 0, dtype=np.int16)",
         url: Some("https://numpy.org/doc/stable/reference/generated/numpy.zeros.html"),
         fix_eligible: false,
     },
@@ -524,7 +536,11 @@ mask = np.ones((512, 512), dtype=np.int8)",
 Functions from Python's `math` module (sqrt, log, exp, etc.) operate on a
 single scalar.  Inside a loop this means N Python function calls.  NumPy
 ufuncs (np.sqrt, np.log) operate on whole arrays in C — the same work done
-in a single call, with SIMD acceleration.",
+in a single call, with SIMD acceleration.
+
+On a genuine scalar outside a loop, math.sqrt is *faster* than the numpy
+ufunc, which pays array-dispatch overhead for one value.  Outside a loop the
+rule therefore fires only when the argument is known to be an array.",
         bad_example: "\
 for val in arr:
     output.append(math.sqrt(val))   # 10 000 Python calls for 10 000 elements",

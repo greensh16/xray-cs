@@ -3,6 +3,7 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Query, QueryCursor};
 
 use crate::{
+    bindings::Origin,
     config::Config,
     diagnostic::{Diagnostic, RuleMeta, Severity},
     parser,
@@ -203,7 +204,21 @@ impl RuleSet for XarrayRules {
                             .map(|f| f.id() == node.id())
                             .unwrap_or(false);
 
-                        if !is_method_call {
+                        // Receiver check: `.values` is a genuine problem on an
+                        // xarray object, but `df.values` is the documented pandas
+                        // idiom and a dict's `.values` is unrelated. Stay silent
+                        // only when the receiver is *provably* something else —
+                        // an unknown receiver (a function parameter, say) keeps
+                        // the original behaviour rather than going quiet.
+                        let receiver_is_other = query
+                            .capture_index_for_name("xr_values_obj")
+                            .and_then(|i| m.nodes_for_capture_index(i).next())
+                            .and_then(|obj| file.bindings.origin_of(obj, source, &file.imports))
+                            .is_some_and(|o| {
+                                matches!(o, Origin::Pandas | Origin::Numpy | Origin::Plain)
+                            });
+
+                        if !is_method_call && !receiver_is_other {
                             let (line, col) = position(&node);
                             let severity = if config.xarray.values_access_is_error {
                                 Severity::Error
@@ -512,5 +527,184 @@ impl RuleSet for XarrayRules {
         }
 
         diags
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse_source;
+
+    /// Rule IDs fired by `src`, in line order.
+    ///
+    /// Calls `XarrayRules::check` directly rather than `rules::run_all`, so a
+    /// failure points at this rule set alone — import gating and the
+    /// cross-domain redundancy filter are deliberately not in the way.
+    fn ids(src: &str) -> Vec<&'static str> {
+        let parsed = parse_source(src.to_string()).unwrap();
+        let mut diags = XarrayRules::check(&parsed, "<test>", &Config::default());
+        diags.sort_by_key(|d| (d.line, d.rule_id));
+        diags.into_iter().map(|d| d.rule_id).collect()
+    }
+
+    fn fires(rule: &'static str, src: &str) -> bool {
+        ids(src).contains(&rule)
+    }
+
+    const IMPORTS: &str = "import xarray as xr\n";
+
+    #[test]
+    fn xr001_open_without_chunks() {
+        assert!(fires(
+            "XR001",
+            &format!("{IMPORTS}ds = xr.open_dataset('a.nc')\n")
+        ));
+        assert!(!fires(
+            "XR001",
+            &format!("{IMPORTS}ds = xr.open_dataset('a.nc', chunks='auto')\n")
+        ));
+    }
+
+    #[test]
+    fn xr002_values_property_but_not_method() {
+        assert!(fires(
+            "XR002",
+            &format!("{IMPORTS}ds = xr.open_dataset('a.nc', chunks='auto')\nv = ds.values\n")
+        ));
+        assert!(!fires(
+            "XR002",
+            &format!("{IMPORTS}d = {{}}\nfor k in d.values():\n    pass\n")
+        ));
+    }
+
+    #[test]
+    fn xr003_dimension_names_only() {
+        assert!(fires(
+            "XR003",
+            &format!(
+                "{IMPORTS}ds = xr.open_dataset('a.nc', chunks='auto')\nfor t in ds.time:\n    pass\n"
+            )
+        ));
+        // An ordinary attribute is not a dimension.
+        assert!(!fires(
+            "XR003",
+            &format!("{IMPORTS}for f in self.files:\n    pass\n")
+        ));
+    }
+
+    #[test]
+    fn xr004_float_coordinates_including_negative() {
+        assert!(fires("XR004", &format!("{IMPORTS}x = ds.sel(lat=33.5)\n")));
+        assert!(fires("XR004", &format!("{IMPORTS}x = ds.sel(lat=-33.5)\n")));
+        assert!(!fires(
+            "XR004",
+            &format!("{IMPORTS}x = ds.sel(time='2020')\n")
+        ));
+    }
+
+    #[test]
+    fn xr005_compute_inside_a_loop_only() {
+        assert!(fires(
+            "XR005",
+            &format!("{IMPORTS}for p in parts:\n    ds.sel(t=p).compute()\n")
+        ));
+        assert!(!fires("XR005", &format!("{IMPORTS}ds.compute()\n")));
+    }
+
+    #[test]
+    fn xr006_to_array_without_dim() {
+        assert!(fires("XR006", &format!("{IMPORTS}a = ds.to_array()\n")));
+        assert!(!fires(
+            "XR006",
+            &format!("{IMPORTS}a = ds.to_array(dim='v')\n")
+        ));
+    }
+
+    #[test]
+    fn xr007_concat_in_loop_is_xarray_only() {
+        assert!(fires(
+            "XR007",
+            &format!("{IMPORTS}for f in files:\n    out = xr.concat([out, f], dim='time')\n")
+        ));
+        // pandas concat is NP002's business, not XR007's.
+        assert!(!fires(
+            "XR007",
+            &format!(
+                "{IMPORTS}import pandas as pd\nfor f in files:\n    out = pd.concat([out, f])\n"
+            )
+        ));
+    }
+
+    #[test]
+    fn xr008_open_mfdataset_without_parallel() {
+        assert!(fires(
+            "XR008",
+            &format!("{IMPORTS}ds = xr.open_mfdataset('*.nc', chunks='auto')\n")
+        ));
+        assert!(!fires(
+            "XR008",
+            &format!("{IMPORTS}ds = xr.open_mfdataset('*.nc', chunks='auto', parallel=True)\n")
+        ));
+    }
+
+    #[test]
+    fn xr009_apply_ufunc_dask_allowed() {
+        assert!(fires(
+            "XR009",
+            &format!("{IMPORTS}r = xr.apply_ufunc(f, ds, dask='allowed')\n")
+        ));
+        assert!(!fires(
+            "XR009",
+            &format!("{IMPORTS}r = xr.apply_ufunc(f, ds, dask='parallelized')\n")
+        ));
+        assert!(!fires(
+            "XR009",
+            &format!("{IMPORTS}r = xr.apply_ufunc(f, ds)\n")
+        ));
+    }
+
+    #[test]
+    fn xr010_merge_in_loop_is_xarray_only() {
+        assert!(fires(
+            "XR010",
+            &format!("{IMPORTS}for f in files:\n    out = xr.merge([out, f])\n")
+        ));
+        assert!(!fires(
+            "XR010",
+            &format!("{IMPORTS}out = xr.merge(items)\n")
+        ));
+    }
+
+    #[test]
+    fn xr011_to_netcdf_without_encoding() {
+        assert!(fires("XR011", &format!("{IMPORTS}ds.to_netcdf('o.nc')\n")));
+        assert!(!fires(
+            "XR011",
+            &format!("{IMPORTS}ds.to_netcdf('o.nc', encoding=enc)\n")
+        ));
+    }
+
+    #[test]
+    fn kwargs_splat_silences_missing_keyword_rules() {
+        // The keyword may well be in **opts, so a "missing keyword" rule
+        // cannot claim it is absent.
+        assert!(!fires(
+            "XR001",
+            &format!("{IMPORTS}ds = xr.open_dataset('a.nc', **opts)\n")
+        ));
+        assert!(!fires(
+            "XR011",
+            &format!("{IMPORTS}ds.to_netcdf('o.nc', **opts)\n")
+        ));
+    }
+
+    #[test]
+    fn disabled_rules_do_not_fire() {
+        let src = format!("{IMPORTS}ds = xr.open_dataset('a.nc')\n");
+        let parsed = parse_source(src).unwrap();
+        let mut config = Config::default();
+        config.disable.insert("XR001".to_string());
+        let diags = XarrayRules::check(&parsed, "<test>", &config);
+        assert!(diags.iter().all(|d| d.rule_id != "XR001"));
     }
 }

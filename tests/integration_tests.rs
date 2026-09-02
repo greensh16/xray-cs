@@ -1775,3 +1775,240 @@ fn compute_in_loop_reports_one_rule_per_position() {
         );
     }
 }
+
+// ── receiver tracking (ToFix §19 — accuracy) ─────────────────────────────────
+
+/// Lint an inline snippet with default config.
+fn check_src(source: &str) -> Vec<xray::diagnostic::Diagnostic> {
+    let parsed = parser::parse_source(source.to_string()).unwrap();
+    let config = Config::default();
+    let mut diags = rules::run_all(&parsed, "<inline>", &config);
+    diags.sort_by_key(|d| (d.line, d.rule_id));
+    diags
+}
+
+fn ids_of(diags: &[xray::diagnostic::Diagnostic], rule: &str) -> Vec<usize> {
+    diags
+        .iter()
+        .filter(|d| d.rule_id == rule)
+        .map(|d| d.line)
+        .collect()
+}
+
+#[test]
+fn xr002_ignores_pandas_and_numpy_receivers() {
+    let diags = check_src(
+        "import xarray as xr\n\
+         import pandas as pd\n\
+         import numpy as np\n\
+         df = pd.read_csv('a.csv')\n\
+         arr = np.zeros(3, dtype=np.float32)\n\
+         a = df.values\n\
+         b = arr.values\n",
+    );
+    assert!(
+        ids_of(&diags, "XR002").is_empty(),
+        "XR002 must not fire on pandas/numpy receivers: {diags:?}"
+    );
+}
+
+#[test]
+fn xr002_still_fires_on_xarray_receivers() {
+    let diags = check_src(
+        "import xarray as xr\n\
+         ds = xr.open_dataset('a.nc', chunks='auto')\n\
+         a = ds.values\n",
+    );
+    assert_eq!(
+        ids_of(&diags, "XR002"),
+        vec![3],
+        "XR002 must still fire on a known xarray receiver"
+    );
+}
+
+#[test]
+fn xr002_still_fires_on_unknown_receivers() {
+    // A function parameter has no known origin. Rules must keep their prior
+    // behaviour rather than silently going quiet on everything untracked.
+    let diags = check_src(
+        "import xarray as xr\n\
+         def process(ds):\n\
+         \x20   return ds.values\n",
+    );
+    assert_eq!(ids_of(&diags, "XR002"), vec![3]);
+}
+
+#[test]
+fn dk004_ignores_idiomatic_reduce_then_compute() {
+    let diags = check_src(
+        "import xarray as xr\n\
+         ds = xr.open_dataset('a.nc', chunks='auto')\n\
+         a = ds.mean().compute()\n\
+         b = ds.sum().compute()\n\
+         c = ds.sel(time='2020').compute()\n",
+    );
+    assert!(
+        ids_of(&diags, "DK004").is_empty(),
+        "DK004 must not fire on reduce-then-compute: {diags:?}"
+    );
+}
+
+#[test]
+fn dk004_still_fires_on_construct_then_compute() {
+    let diags = check_src(
+        "import dask.array as da\n\
+         vals = [1, 2, 3]\n\
+         d = da.from_array(vals).compute()\n",
+    );
+    assert_eq!(
+        ids_of(&diags, "DK004"),
+        vec![3],
+        "DK004 must still fire when the graph never did any work"
+    );
+}
+
+#[test]
+fn np004_ignores_scalars_outside_a_loop() {
+    let diags = check_src(
+        "import numpy as np\n\
+         import math\n\
+         x = math.sqrt(2.0)\n",
+    );
+    assert!(
+        ids_of(&diags, "NP004").is_empty(),
+        "NP004 must not hint on a genuine scalar: {diags:?}"
+    );
+}
+
+#[test]
+fn np004_fires_on_arrays_outside_a_loop() {
+    let diags = check_src(
+        "import numpy as np\n\
+         import math\n\
+         arr = np.arange(10, dtype=np.float32)\n\
+         x = math.sqrt(arr)\n",
+    );
+    assert_eq!(ids_of(&diags, "NP004"), vec![4]);
+}
+
+#[test]
+fn np004_still_fires_on_scalars_inside_a_loop() {
+    // The iteration itself is the problem here, whatever the argument is.
+    let diags = check_src(
+        "import numpy as np\n\
+         import math\n\
+         out = []\n\
+         for v in range(10):\n\
+         \x20   out.append(math.sqrt(v))\n",
+    );
+    assert_eq!(ids_of(&diags, "NP004"), vec![5]);
+}
+
+#[test]
+fn np003_describes_full_dtype_inference_correctly() {
+    let diags = check_src(
+        "import numpy as np\n\
+         a = np.full((4, 4), 0)\n\
+         b = np.zeros((4, 4))\n",
+    );
+    let full = diags
+        .iter()
+        .find(|d| d.rule_id == "NP003" && d.line == 2)
+        .expect("NP003 should fire for np.full");
+    assert!(
+        full.message
+            .contains("infers its dtype from the fill value"),
+        "np.full infers int64 from `0`, it does not default to float64: {}",
+        full.message
+    );
+    let zeros = diags
+        .iter()
+        .find(|d| d.rule_id == "NP003" && d.line == 3)
+        .expect("NP003 should fire for np.zeros");
+    assert!(zeros.message.contains("float64"));
+}
+
+#[test]
+fn np007b_matches_assigned_apply_in_loop() {
+    // The old `(_)*` query shape only saw bare expression statements, so an
+    // assigned result inside a loop was missed entirely.
+    let diags = check_src(
+        "import pandas as pd\n\
+         df = pd.DataFrame({'a': [1]})\n\
+         for i in range(3):\n\
+         \x20   out = df.apply(lambda r: r + 1)\n",
+    );
+    assert_eq!(ids_of(&diags, "NP007"), vec![4]);
+}
+
+#[test]
+fn np007b_reports_one_diagnostic_per_call() {
+    // The `(_)* ... (_)*` shape could match at several split points.
+    let diags = check_src(
+        "import pandas as pd\n\
+         df = pd.DataFrame({'a': [1]})\n\
+         for i in range(3):\n\
+         \x20   print(1)\n\
+         \x20   df.apply(lambda r: r + 1)\n\
+         \x20   print(2)\n",
+    );
+    assert_eq!(ids_of(&diags, "NP007"), vec![5]);
+}
+
+#[test]
+fn np007b_does_not_fire_outside_a_loop() {
+    let diags = check_src(
+        "import pandas as pd\n\
+         df = pd.DataFrame({'a': [1]})\n\
+         out = df.apply(lambda r: r + 1)\n",
+    );
+    assert!(ids_of(&diags, "NP007").is_empty());
+}
+
+// ── suppression scoping and CRLF rendering (ToFix §34) ───────────────────────
+
+#[test]
+fn docstring_examples_do_not_suppress_real_diagnostics() {
+    // A docstring demonstrating how to suppress a rule used to suppress it for
+    // real — `disable-file=` inside a docstring took out the whole file.
+    let diags = check_src(
+        "import xarray as xr\n\
+         def helper():\n\
+         \x20   \"\"\"\n\
+         \x20   To silence this rule, write:\n\
+         \x20       ds = xr.open_dataset('a.nc')  # xray: disable-file=XR001\n\
+         \x20   \"\"\"\n\
+         \x20   return None\n\
+         ds = xr.open_dataset('real.nc')\n",
+    );
+    assert_eq!(
+        ids_of(&diags, "XR001"),
+        vec![8],
+        "the real open_dataset on line 8 must still be reported"
+    );
+}
+
+#[test]
+fn inline_suppression_rule_ids_are_case_insensitive() {
+    let diags =
+        check_src("import xarray as xr\nds = xr.open_dataset('a.nc')  # xray: disable=xr001\n");
+    assert!(
+        ids_of(&diags, "XR001").is_empty(),
+        "lowercase inline rule IDs must work, as they do in --disable and xray.toml"
+    );
+}
+
+#[test]
+fn crlf_and_lf_sources_produce_identical_diagnostics() {
+    let lf = "import xarray as xr\n# pad\n# pad\nds = xr.open_dataset('a.nc')\n";
+    let crlf = lf.replace('\n', "\r\n");
+    let a: Vec<_> = check_src(lf)
+        .into_iter()
+        .map(|d| (d.rule_id, d.line, d.column))
+        .collect();
+    let b: Vec<_> = check_src(&crlf)
+        .into_iter()
+        .map(|d| (d.rule_id, d.line, d.column))
+        .collect();
+    assert_eq!(a, b, "line endings must not shift diagnostic positions");
+}

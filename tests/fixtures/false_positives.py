@@ -11,6 +11,7 @@ import netCDF4
 import zarr
 import h5py
 import dask.array as da
+import math
 
 
 # XR003 — iterating an ordinary attribute is not a dimension loop
@@ -76,3 +77,24 @@ def open_h5(path):
 # IO002 is config-gated, netCDF4 imported only to arm the IO domain above
 _ = netCDF4
 _ = zarr
+
+
+# NP004 must not fire on genuine scalars outside a loop: for a single float,
+# math.sqrt is faster than the numpy ufunc, so the hint was actively wrong.
+scalar_root = math.sqrt(2.0)
+scalar_log = math.log(10.0)
+
+# XR002 must not fire on a pandas receiver: `.values` is the documented idiom
+# on a DataFrame, and only looks like the xarray anti-pattern.
+frame = pd.DataFrame({"a": [1, 2, 3]})
+frame_values = frame.values
+
+# XR002 must not fire on a plain numpy array either.
+plain = np.zeros(4, dtype=np.float32)
+plain_values = plain.values
+
+# DK004 must not fire on the idiomatic reduce-then-compute: dask did the
+# parallel work and the small result is what you asked for.
+ds_lazy = xr.open_dataset("big.nc", chunks="auto")
+reduced = ds_lazy.mean().compute()
+total = ds_lazy.sum().compute()

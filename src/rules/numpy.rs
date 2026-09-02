@@ -198,7 +198,17 @@ impl RuleSet for NumpyRules {
                                     path,
                                     line,
                                     col,
-                                    format!("`{fn_name}()` without `dtype=` defaults to float64 — double the memory for integer workloads"),
+                                    if fn_name_raw == "full" {
+                                        // np.full infers from the fill value —
+                                        // `0` gives int64, not float64.
+                                        format!(
+                                            "`{fn_name}()` without `dtype=` infers its dtype from the fill value (`0` → int64, `0.0` → float64) rather than the precision you intend"
+                                        )
+                                    } else {
+                                        format!(
+                                            "`{fn_name}()` without `dtype=` defaults to float64 — double the memory for integer workloads"
+                                        )
+                                    },
                                 )
                                 .with_suggestion("Add `dtype=np.float32` (or int32, int16 etc.) to match your actual data precision")
                                 .with_url("https://github.com/greensh16/xray/wiki/NumPy-Pandas-Rules#np003"),
@@ -222,6 +232,21 @@ impl RuleSet for NumpyRules {
                             .map(|n| node_text(&n, source))
                             .unwrap_or("fn");
                         let in_loop = is_inside_loop(node);
+                        // Outside a loop, `math.sqrt(x)` on a genuine scalar is
+                        // *faster* than the numpy ufunc — the hint was actively
+                        // wrong there. Only suggest the array form when the
+                        // argument is demonstrably an array. Inside a loop the
+                        // iteration itself is the problem, so that still fires.
+                        if !in_loop {
+                            let arg_is_array = node
+                                .child_by_field_name("arguments")
+                                .and_then(|args| args.named_child(0))
+                                .and_then(|a| file.bindings.origin_of(a, source, &file.imports))
+                                .is_some_and(|o| o.is_array_like());
+                            if !arg_is_array {
+                                continue;
+                            }
+                        }
                         let (severity, message) = if in_loop {
                             (
                                 Severity::Warning,
@@ -331,6 +356,10 @@ impl RuleSet for NumpyRules {
                         .capture_index_for_name("np_apply_in_loop")
                         .and_then(|i| m.nodes_for_capture_index(i).next())
                     {
+                        // Loop context now lives here rather than in the query.
+                        if !is_inside_loop(node) {
+                            continue;
+                        }
                         let (line, col) = position(&node);
                         diags.push(
                             Diagnostic::new(
@@ -371,4 +400,156 @@ fn inner_subscript_is_string_key(outer: tree_sitter::Node<'_>, _source: &[u8]) -
         return false;
     };
     matches!(subscript.kind(), "string" | "concatenated_string")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse_source;
+
+    /// Rule IDs fired by `src`, in line order.
+    fn ids(src: &str) -> Vec<&'static str> {
+        let parsed = parse_source(src.to_string()).unwrap();
+        let mut diags = NumpyRules::check(&parsed, "<test>", &Config::default());
+        diags.sort_by_key(|d| (d.line, d.rule_id));
+        diags.into_iter().map(|d| d.rule_id).collect()
+    }
+
+    fn fires(rule: &'static str, src: &str) -> bool {
+        ids(src).contains(&rule)
+    }
+
+    const IMPORTS: &str = "import numpy as np\nimport pandas as pd\nimport math\n";
+
+    #[test]
+    fn np001_iterrows() {
+        assert!(fires(
+            "NP001",
+            &format!("{IMPORTS}for i, row in df.iterrows():\n    pass\n")
+        ));
+    }
+
+    #[test]
+    fn np001_respects_the_config_toggle() {
+        let src = format!("{IMPORTS}for i, row in df.iterrows():\n    pass\n");
+        let parsed = parse_source(src).unwrap();
+        let mut config = Config::default();
+        config.numpy.flag_iterrows = false;
+        let diags = NumpyRules::check(&parsed, "<test>", &config);
+        assert!(diags.iter().all(|d| d.rule_id != "NP001"));
+    }
+
+    #[test]
+    fn np002_concat_in_loop_only() {
+        assert!(fires(
+            "NP002",
+            &format!("{IMPORTS}for f in files:\n    out = pd.concat([out, f])\n")
+        ));
+        assert!(fires(
+            "NP002",
+            &format!("{IMPORTS}for f in files:\n    out = np.concatenate([out, f])\n")
+        ));
+        assert!(!fires(
+            "NP002",
+            &format!("{IMPORTS}out = pd.concat(frames)\n")
+        ));
+    }
+
+    #[test]
+    fn np003_allocation_without_dtype() {
+        assert!(fires("NP003", &format!("{IMPORTS}g = np.zeros((4, 4))\n")));
+        assert!(!fires(
+            "NP003",
+            &format!("{IMPORTS}g = np.zeros((4, 4), dtype=np.float32)\n")
+        ));
+        // da.ones() is not numpy's.
+        assert!(!fires("NP003", &format!("{IMPORTS}g = da.ones((4, 4))\n")));
+    }
+
+    #[test]
+    fn np003_describes_full_dtype_inference_not_float64() {
+        let parsed = parse_source(format!("{IMPORTS}g = np.full((4, 4), 0)\n")).unwrap();
+        let diags = NumpyRules::check(&parsed, "<test>", &Config::default());
+        let msg = &diags
+            .iter()
+            .find(|d| d.rule_id == "NP003")
+            .expect("NP003 should fire for np.full")
+            .message;
+        // np.full(shape, 0) is int64, inferred from the fill value.
+        assert!(
+            msg.contains("infers its dtype from the fill value"),
+            "{msg}"
+        );
+        assert!(!msg.contains("defaults to float64"), "{msg}");
+    }
+
+    #[test]
+    fn np004_warns_in_a_loop_whatever_the_argument() {
+        assert!(fires(
+            "NP004",
+            &format!("{IMPORTS}for v in range(3):\n    x = math.sqrt(v)\n")
+        ));
+    }
+
+    #[test]
+    fn np004_outside_a_loop_needs_a_known_array() {
+        // A genuine scalar: math.sqrt beats the ufunc, so the hint would be
+        // pointing the wrong way.
+        assert!(!fires("NP004", &format!("{IMPORTS}x = math.sqrt(2.0)\n")));
+        assert!(fires(
+            "NP004",
+            &format!("{IMPORTS}arr = np.arange(4, dtype=np.float32)\nx = math.sqrt(arr)\n")
+        ));
+    }
+
+    #[test]
+    fn np005_chained_indexing_needs_a_string_key() {
+        assert!(fires("NP005", &format!("{IMPORTS}v = df['a'][0]\n")));
+        // Nested lists are ordinary indexing, not pandas chained assignment.
+        assert!(!fires("NP005", &format!("{IMPORTS}v = grid[1][2]\n")));
+    }
+
+    #[test]
+    fn np006_matrix_deprecated() {
+        assert!(fires(
+            "NP006",
+            &format!("{IMPORTS}m = np.matrix([[1, 2]])\n")
+        ));
+        assert!(!fires(
+            "NP006",
+            &format!("{IMPORTS}m = np.array([[1, 2]])\n")
+        ));
+    }
+
+    #[test]
+    fn np007a_applymap_anywhere() {
+        assert!(fires("NP007", &format!("{IMPORTS}out = df.applymap(f)\n")));
+    }
+
+    #[test]
+    fn np007b_apply_lambda_inside_a_loop_only() {
+        assert!(fires(
+            "NP007",
+            &format!("{IMPORTS}for c in cols:\n    df[c].apply(lambda x: x * 2)\n")
+        ));
+        // Assigned result: the old query shape only saw bare expression
+        // statements, so this — the example in the rule's own docs — was missed.
+        assert!(fires(
+            "NP007",
+            &format!("{IMPORTS}for c in cols:\n    df[c] = df[c].apply(lambda x: x * 2)\n")
+        ));
+        assert!(!fires(
+            "NP007",
+            &format!("{IMPORTS}out = df.apply(lambda x: x * 2)\n")
+        ));
+    }
+
+    #[test]
+    fn np007b_reports_one_diagnostic_per_call() {
+        // The old `(_)* ... (_)*` shape could match at several split points.
+        let src = format!(
+            "{IMPORTS}for c in cols:\n    print(1)\n    df[c].apply(lambda x: x)\n    print(2)\n"
+        );
+        assert_eq!(ids(&src).iter().filter(|id| **id == "NP007").count(), 1);
+    }
 }
