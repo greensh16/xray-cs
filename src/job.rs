@@ -210,12 +210,10 @@ fn parse_pbs(job: &mut JobScript, body: &str, line: usize, raw: &str) {
                                     job.memory_bytes = Some(Directive::new(b, line, raw));
                                 }
                             }
-                            "ngpus" => {
-                                // `ngpus=0` is a request for none.
-                                if value.trim().parse::<usize>().is_ok_and(|n| n > 0) {
-                                    job.gpu =
-                                        Some(Directive::new(value.trim().to_string(), line, raw));
-                                }
+                            // `ngpus=0` is a request for none, so the count
+                            // has to be positive for this to be a GPU job.
+                            "ngpus" if value.trim().parse::<usize>().is_ok_and(|n| n > 0) => {
+                                job.gpu = Some(Directive::new(value.trim().to_string(), line, raw));
                             }
                             _ => {}
                         }

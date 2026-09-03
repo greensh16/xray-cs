@@ -515,7 +515,11 @@ For every new rule, update or create:
 Before submitting, verify:
 
 - [ ] `cargo test` passes with no failures.
-- [ ] `cargo clippy -- -D warnings` produces no warnings.
+- [ ] `cargo clippy --all-targets --all-features -- -D warnings` produces no warnings.
+      This is the exact command the CI lint job runs; the bare `cargo clippy` form skips
+      tests, benches and the bin target. CI resolves `stable` fresh, so run
+      `rustup update stable` first — a lint added in a newer release will fail CI even
+      though your local run was clean.
 - [ ] `cargo fmt --check` reports no formatting issues.
 - [ ] New rule has both a unit test and a fixture-based integration test.
 - [ ] `docs/rules/<domain>.md` updated with the new rule section.
