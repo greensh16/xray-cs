@@ -8,6 +8,7 @@ pub mod explain;
 pub mod fix;
 pub mod ignore;
 pub mod init;
+pub mod job;
 pub mod lsp;
 pub mod notebook;
 pub mod parser;

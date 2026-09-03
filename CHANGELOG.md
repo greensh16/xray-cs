@@ -9,6 +9,146 @@ xray uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Published to crates.io as `xray-cs`.** The name `xray` was already taken by
+  an unrelated 2018 crate, so the package — and only the package — is renamed:
+
+  ```bash
+  cargo install xray-cs      # installs a binary called `xray`
+  ```
+
+  Nothing user-facing changes. The command is still `xray`, the config file is
+  still `xray.toml`, suppression comments are still `# xray: disable=`, the
+  environment variables are still `XRAY_*`, the ignore file is still
+  `.xrayignore`, and the library target is still `xray` so `use xray::` keeps
+  working. Existing projects need no migration.
+
+- The GitHub repository moved to **`greensh16/xray-cs`**. Every docs URL —
+  including the wiki links embedded in diagnostics — points at the new
+  location. GitHub redirects the old URLs, so older releases keep working.
+
+---
+
+## [1.2.0] — 2026-09-03
+
+The v1.2 milestone: rule expansion into pandas and SciPy, HPC job-script
+awareness, and pathological chunk detection. **33 rules grow to 47.**
+
+No rule IDs, config keys or output schemas changed incompatibly, and nothing
+new fires unless you import the library it covers. The JOB domain is opt-in and
+runs only when you supply a submission script.
+
+### Added — pandas domain (PD001–PD005)
+
+Gated on `import pandas`, separate from the pandas rules that live in the NP
+domain for historical reasons.
+
+- **PD001** — `iterrows()` inside an *enclosing* loop (Error). Distinct from
+  NP001, which flags `iterrows()` anywhere: the plain
+  `for i, row in df.iterrows():` puts the call in the loop header, evaluated
+  once. PD001 is the nested case, where the whole row-by-row pass repeats per
+  outer iteration.
+- **PD002** — `DataFrame.append()`, **removed** in pandas 2.0 (Error). Fires
+  only when the receiver is a *known* pandas object — `list.append` is the most
+  common method call in Python, so this rule deliberately inverts xray's usual
+  "an unknown receiver keeps the previous behaviour" convention.
+- **PD003** — chained assignment `df[...][...] = ...` (Error). The write can
+  land on a temporary copy and vanish; under copy-on-write in pandas 3.0 it
+  silently does nothing. NP005 flags the read form; this is the form that loses
+  data. Requires evidence the receiver is a DataFrame, so `grid[1][2] = 0` on a
+  list of lists is untouched.
+- **PD004** — `pd.read_csv()` without `dtype=` (Hint).
+- **PD005** — `.to_csv()` without `index=False` (Hint). An explicit
+  `index=True` is a decision and is left alone.
+
+PD001 supersedes NP001 and PD003 supersedes NP005 when both land on the same
+position, so one call never reports twice.
+
+### Added — SciPy domain (SP001–SP002)
+
+Gated on `import scipy`. Both resolve the callee through the import table
+rather than trusting the method name.
+
+- **SP001** — `scipy.integrate.quad()` inside a loop (Warning); `quad_vec()`
+  makes one adaptive pass and shares the subdivision across components.
+- **SP002** — `scipy.linalg.inv()` (Warning); `solve()` is about twice as fast
+  and loses roughly half as many digits on an ill-conditioned matrix.
+
+### Added — HPC job-script awareness (JOB001–JOB005)
+
+`xray --job run.sh analysis.py` parses `#SBATCH` / `#PBS` directives and
+cross-checks the requested allocation against what the Python actually does.
+Every other Python linter stops at the file boundary; the resource request is
+where HPC jobs are most often wrong.
+
+- **JOB001** — allocated cores do not match the dask cluster built
+  (`--cpus-per-task=48` with `LocalCluster(n_workers=4)`).
+- **JOB002** — a multi-core request with nothing capping BLAS threads, neither
+  `OMP_NUM_THREADS` in the script nor `threads_per_worker=` in Python.
+- **JOB003** — a memory request paired with an unchunked `open_dataset` /
+  `open_mfdataset` (Error — the outcome is an OOM-killed job, not a wasted
+  allocation).
+- **JOB004** — a GPU requested by a run that imports no GPU library. The only
+  rule in xray evaluated across the whole run rather than per file, and the
+  only one reported against the job script rather than the Python.
+- **JOB005** — `n_jobs=-1` or an unbounded `Pool()` under a partial-node
+  allocation. Silent under `--exclusive`, where taking every core is correct.
+
+Opt-in via `--job` / `XRAY_JOB`, or `[job].script` in `xray.toml` for CI. Job
+scripts are read purely syntactically: the shell is never executed and no
+variable is expanded, so a directive xray cannot read (`--cpus-per-task=$NCPUS`)
+produces no finding rather than a guess.
+
+### Added — pathological chunk specifications (XR012, DK010)
+
+Array shapes need a runtime; literal chunk arguments do not.
+
+- **XR012** — a literal chunk length of 1 in `chunks=` or `.chunk()` (Warning).
+  The classic Lustre killer: one dask task and one metadata round-trip per index
+  along that dimension.
+- **DK010** — `.rechunk()` to a literal chunk of 1, or to a chunk whose literal
+  extents multiply out to under 64 elements (Warning). Independent of DK008:
+  that rule is about *where* a rechunk happens, this one about *what* it asks
+  for, and both can be true of one call.
+
+Only literals are judged. `chunks="auto"`, a variable, and `-1` ("one chunk
+along this axis" — a deliberate instruction) all say nothing. The
+trivially-small check applies only to positional tuple/list specs, which cover
+every dimension; a dict spec leaves the dimensions it omits at full extent, so
+`chunks={"time": 24}` is not a 24-element chunk and is never reported.
+
+### Fixed
+
+- **Assignment to a subscript or attribute no longer clears a name's tracked
+  origin.** `df["a"] = 1` was recorded as rebinding `df` itself, degrading it
+  to unknown — and because the degradation happened while walking the very
+  statement under inspection, it took the origin away from rules asking about
+  that same line. Only real binding positions are collected now. This makes
+  receiver tracking more accurate for XR002, NP004 and the new PD rules.
+
+- **`call_module` resolves `from <pkg> import <submodule>` receivers.**
+  `import scipy.integrate as integrate` binds an alias and
+  `from scipy import integrate` binds a name; both spell the call
+  `integrate.quad(...)`, but only the first resolved. The second now falls back
+  to the from-import table, which makes every library-gated rule more accurate
+  for that import style.
+
+- **`docs/configuration.md` documented four per-domain config keys that never
+  existed** (`min_files_threshold`, `max_computes_per_loop`,
+  `loadtxt_size_threshold`, `scipy_size_threshold_mb`). Since every config
+  section rejects unknown keys, copying that schema produced a hard parse
+  failure. Replaced with the real keys.
+
+### Changed
+
+- `xray doctor` reports the new domains and their gates, including a dedicated
+  line for the JOB domain — "skipped (not imported)" would be the wrong
+  explanation for a domain gated on a file outside the Python.
+- `xray init` scaffolds a commented `[job]` section.
+- README rule tables and `docs/rules/index.md` regenerated from
+  `xray rules --format json`.
+
 ---
 
 ## [1.1.0] — 2026-09-02
@@ -395,7 +535,7 @@ Correctness elsewhere:
   - Respects `.xrayignore` and `[paths]` config excludes.
   - Prints a separator-bordered change summary to stderr on each lint cycle.
 - **Diagnostic URLs** — all 25 rules now carry a `url` pointing to
-  `https://github.com/greensh16/xray/rules/<RULE_ID>` for in-editor "more info" links.
+  `https://github.com/greensh16/xray-cs/rules/<RULE_ID>` for in-editor "more info" links.
   Five previously missing URLs added: DK002, NP002, NP003, NP004, IO004.
 
 ### Changed
@@ -545,16 +685,16 @@ Correctness elsewhere:
 
 ---
 
-[Unreleased]: https://github.com/greensh16/xray/compare/v1.1.0...HEAD
-[1.1.0]: https://github.com/greensh16/xray/compare/v1.0.1...v1.1.0
-[1.0.1]: https://github.com/greensh16/xray/compare/v1.0.0...v1.0.1
-[1.0.0]: https://github.com/greensh16/xray/compare/v0.9.0...v1.0.0
-[0.9.0]: https://github.com/greensh16/xray/compare/v0.8.0...v0.9.0
-[0.8.0]: https://github.com/greensh16/xray/compare/v0.7.0...v0.8.0
-[0.7.0]: https://github.com/greensh16/xray/compare/v0.6.0...v0.7.0
-[0.6.0]: https://github.com/greensh16/xray/compare/v0.5.0...v0.6.0
-[0.5.0]: https://github.com/greensh16/xray/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/greensh16/xray/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/greensh16/xray/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/greensh16/xray/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/greensh16/xray/releases/tag/v0.1.0
+[Unreleased]: https://github.com/greensh16/xray-cs/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/greensh16/xray-cs/compare/v1.0.1...v1.1.0
+[1.0.1]: https://github.com/greensh16/xray-cs/compare/v1.0.0...v1.0.1
+[1.0.0]: https://github.com/greensh16/xray-cs/compare/v0.9.0...v1.0.0
+[0.9.0]: https://github.com/greensh16/xray-cs/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/greensh16/xray-cs/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/greensh16/xray-cs/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/greensh16/xray-cs/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/greensh16/xray-cs/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/greensh16/xray-cs/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/greensh16/xray-cs/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/greensh16/xray-cs/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/greensh16/xray-cs/releases/tag/v0.1.0

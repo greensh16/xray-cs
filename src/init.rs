@@ -79,6 +79,23 @@ const TEMPLATE: &str = r#"# xray.toml — HPC scientific Python linter configura
 # Flag uncompressed / unchunked storage patterns:
 # np.save (IO001) and direct netCDF4.Dataset opens (IO002).
 # flag_missing_compression = true
+
+
+# ── HPC job scripts ───────────────────────────────────────────────────────────
+# The JOB rules (JOB001-JOB005) cross-check the Python against the submission
+# script that launches it: allocated cores vs. the dask cluster actually built,
+# a memory request vs. an unchunked read, a GPU nobody imports a library for.
+#
+# They are opt-in.  Pass `--job run.sh` on the command line, or set a glob here
+# so CI picks the script up without the flag.  The first match in sorted order
+# is used.
+#
+# Parsing stays purely syntactic: `#SBATCH` / `#PBS` directives are read as
+# text, the shell is never executed, and a directive xray cannot read (say
+# `--cpus-per-task=$NCPUS`) simply produces no finding rather than a guess.
+[job]
+# script = "submit.sh"
+# script = "jobs/*.sh"
 "#;
 
 /// Write `xray.toml` in the current directory.

@@ -31,7 +31,7 @@ be patient, welcoming, and constructive in all interactions. We follow the
 
 **No code required:**
 
-- Report a false positive or false negative by [opening an issue](https://github.com/greensh16/xray/issues/new/choose).
+- Report a false positive or false negative by [opening an issue](https://github.com/greensh16/xray-cs/issues/new/choose).
 - Propose a new rule using the [Rule Request template](.github/ISSUE_TEMPLATE/rule-request.md).
 - Improve documentation — fix a typo, add an example, or clarify a config option.
 - Share a case study: a real HPC script where xray caught a performance issue.
@@ -56,7 +56,7 @@ be patient, welcoming, and constructive in all interactions. We follow the
 ### Clone and build
 
 ```bash
-git clone https://github.com/greensh16/xray.git
+git clone https://github.com/greensh16/xray-cs.git
 cd xray
 cargo build
 ```
@@ -258,7 +258,7 @@ of `check()`, numbered to match your pattern's position in the `.scm` file:
             )
             .with_suggestion("Choose a chunk size matching your storage layout")
             .with_fix_hint("chunks={'time': 24}")
-            .with_url("https://github.com/greensh16/xray/wiki/xarray-Rules#xr012"),
+            .with_url("https://github.com/greensh16/xray-cs/wiki/xarray-Rules#xr012"),
         );
     }
 }
@@ -331,7 +331,7 @@ If the rule deliberately does not fire in some cases, say so here.",
 ds = ds.chunk({\"time\": 1})   # one task per timestep",
     good_example: "\
 ds = ds.chunk({\"time\": 24})  # matches the on-disk chunk layout",
-    url: Some("https://github.com/greensh16/xray/wiki/xarray-Rules#xr012"),
+    url: Some("https://github.com/greensh16/xray-cs/wiki/xarray-Rules#xr012"),
     fix_eligible: false,
 },
 ```

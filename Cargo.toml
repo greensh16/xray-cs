@@ -1,13 +1,18 @@
 [package]
-name = "xray"
-version = "1.1.0"
+# Published to crates.io as `xray-cs` ("xray, climate science") because `xray`
+# was already taken by an unrelated 2018 crate. The tool's own identity is
+# unchanged: the installed binary, the `xray.toml` config, the `# xray:`
+# suppression prefix and the `XRAY_*` environment variables are all still
+# `xray`, and the library target keeps that name too so `use xray::` works.
+name = "xray-cs"
+version = "1.2.0"
 edition = "2024"
 description = "HPC scientific Python linter for xarray, dask, and NumPy workflows"
 authors = ["greensh16 <greensh16@users.noreply.github.com>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/greensh16/xray"
-homepage = "https://github.com/greensh16/xray"
-documentation = "https://github.com/greensh16/xray/wiki"
+repository = "https://github.com/greensh16/xray-cs"
+homepage = "https://github.com/greensh16/xray-cs"
+documentation = "https://github.com/greensh16/xray-cs/wiki"
 readme = "README.md"
 keywords = ["linter", "hpc", "xarray", "dask", "numpy"]
 categories = ["development-tools", "science", "command-line-utilities"]
@@ -18,7 +23,7 @@ exclude = [
     "docs/",
     "editors/",
     "old/",
-    "xray.wiki/",
+    "xray-cs.wiki/",
     "ToFix.md",
     "ROADMAP.md",
     "xray.toml",

@@ -60,6 +60,9 @@ pub struct Config {
 
     #[serde(default)]
     pub io: IoConfig,
+
+    #[serde(default)]
+    pub job: JobConfig,
 }
 
 // ── [paths] ───────────────────────────────────────────────────────────────────
@@ -156,6 +159,20 @@ impl Default for IoConfig {
             flag_missing_compression: default_true(),
         }
     }
+}
+
+/// `[job]` section — HPC submission-script cross-checking.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct JobConfig {
+    /// Glob for the submission script to cross-check against when `--job` is
+    /// not given, so CI picks it up without the flag.
+    ///
+    /// The first match in sorted order is used — a glob's order is not
+    /// specified, and a lint run that chose a different script per machine
+    /// would be worse than choosing none.
+    #[serde(default)]
+    pub script: Option<String>,
 }
 
 fn default_compute_threshold() -> usize {

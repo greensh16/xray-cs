@@ -107,6 +107,9 @@ jobs:
           generate_release_notes: true
 
   # ── crates.io publish ─────────────────────────────────────────────────────────
+  # Publishes the `xray-cs` package (see Cargo.toml for why the registry name
+  # differs from the `xray` binary). Uncomment once CARGO_REGISTRY_TOKEN is set
+  # in the repository secrets.
   #publish-crates:
   #  name: Publish to crates.io
   #  runs-on: ubuntu-22.04

@@ -45,3 +45,7 @@ for step in range(5):
 acc = da.zeros((0,), chunks=100)
 for i in range(10):
     acc = da.concatenate([acc, da.ones((100,), chunks=100)])
+
+# DK010 — a full shuffle to arrive at one task per row.
+grid = da.ones((10000, 1000), chunks=1000)
+tiny = grid.rechunk((1, 1000))

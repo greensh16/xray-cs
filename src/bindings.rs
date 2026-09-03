@@ -378,13 +378,25 @@ fn origin_for_module(module: &str) -> Option<Origin> {
 /// Every identifier in an assignment target, so tuple unpacking shadows all
 /// of its names.
 fn collect_identifiers(node: Node<'_>, source: &[u8], out: &mut Vec<String>) {
-    if node.kind() == "identifier" {
-        out.push(node_text(&node, source).to_string());
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_identifiers(child, source, out);
+    match node.kind() {
+        "identifier" => {
+            out.push(node_text(&node, source).to_string());
+        }
+        // `df["a"] = 1` and `ds.attrs = {}` mutate what the name already
+        // refers to; they do not rebind the name. Treating `df` as reassigned
+        // here degraded it to unknown, and — because the degradation happened
+        // while walking the very statement under inspection — it took the
+        // origin away from rules asking about that same line.
+        //
+        // The subscript *key* is not a binding position either, so nothing
+        // under these nodes is collected.
+        "subscript" | "attribute" => {}
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_identifiers(child, source, out);
+            }
+        }
     }
 }
 

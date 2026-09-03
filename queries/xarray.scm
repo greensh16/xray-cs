@@ -153,3 +153,22 @@
     (#eq? @xr_to_netcdf_attr "to_netcdf")
   )
 ) @xr_to_netcdf_call
+
+
+; XR012 — a literal chunk length of 1 (or a trivially small literal chunk) in
+; `chunks=` or `.chunk()`.
+;
+; Shapes need a runtime; chunk *arguments* do not. `chunks={"time": 1}` on a
+; 40-year hourly dataset is 350k tasks, each one a separate Lustre metadata
+; round-trip — the scheduler and the filesystem do all the work and the CPUs
+; sit idle. One pattern covers both spellings; Rust picks the chunk spec out
+; of the argument list and classifies the literal.
+(call
+  function: [
+    (identifier) @xr_chunkspec_bare
+    (attribute attribute: (identifier) @xr_chunkspec_attr)
+  ]
+  arguments: (argument_list) @xr_chunkspec_args
+  (#match? @xr_chunkspec_bare "^(open_dataset|open_mfdataset|open_zarr|chunk)$")
+  (#match? @xr_chunkspec_attr "^(open_dataset|open_mfdataset|open_zarr|chunk)$")
+) @xr_chunkspec_call

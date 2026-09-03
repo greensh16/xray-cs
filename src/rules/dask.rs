@@ -7,12 +7,13 @@ use crate::{
     diagnostic::{Diagnostic, RuleMeta, Severity},
     fix::Fix,
     parser::{
-        ParsedFile, call_is_from, is_inside_loop, keyword_arg_present_or_unknown, node_text,
-        position,
+        ParsedFile, call_is_from, is_inside_loop, keyword_arg_present_or_unknown,
+        keyword_arg_value_node, node_text, position,
     },
 };
 
 use super::RuleSet;
+use super::chunks::{ChunkVerdict, classify_chunk_spec};
 
 pub struct DaskRules;
 
@@ -108,6 +109,12 @@ impl RuleSet for DaskRules {
                 severity: Severity::Error,
                 description: "da.concatenate() inside a for loop — O(n²) intermediate copies; collect arrays then concatenate once",
             },
+            RuleMeta {
+                id: "DK010",
+                name: "pathological-rechunk",
+                severity: Severity::Warning,
+                description: ".rechunk() to a literal chunk of 1 or a trivially small chunk — pays a full shuffle to arrive at a task per element",
+            },
         ]
     }
 
@@ -171,7 +178,7 @@ impl RuleSet for DaskRules {
                                 "`dask.compute()` called inside a for loop — consider batching all delayed objects and computing once",
                             )
                             .with_suggestion("Collect delayed objects in a list, then call `dask.compute(*items)` outside the loop")
-.with_url("https://github.com/greensh16/xray/wiki/Dask-Rules#DK002"),
+.with_url("https://github.com/greensh16/xray-cs/wiki/Dask-Rules#dk002"),
                         );
                     }
                 }
@@ -363,6 +370,38 @@ impl RuleSet for DaskRules {
                     }
                 }
 
+                // DK010 — .rechunk() to a pathological literal chunk
+                9 if !config.is_disabled("DK010") => {
+                    if let Some(call_node) = query
+                        .capture_index_for_name("dk_rechunk_spec_call")
+                        .and_then(|i| m.nodes_for_capture_index(i).next())
+                    {
+                        let Some(spec) = rechunk_spec_node(call_node, source) else {
+                            continue;
+                        };
+                        let message = match classify_chunk_spec(spec, source) {
+                            ChunkVerdict::SingletonChunk { dim } => match dim {
+                                Some(d) => format!(
+                                    "`.rechunk()` to a chunk length of 1 along `{d}` — a full shuffle whose result is one task per index along that dimension"
+                                ),
+                                None => "`.rechunk()` to a chunk length of 1 — a full shuffle whose result is one task per element along that dimension".to_string(),
+                            },
+                            ChunkVerdict::TriviallySmall { elements } => format!(
+                                "`.rechunk()` to a chunk of {elements} elements — the shuffle costs more than every task it produces will ever compute"
+                            ),
+                            ChunkVerdict::Unknown => continue,
+                        };
+                        let (line, col) = position(&spec);
+                        diags.push(
+                            Diagnostic::new("DK010", Severity::Warning, path, line, col, message)
+                                .with_suggestion(
+                                    "Rechunk to at least ~100 MB per chunk, or pass `chunks=\"auto\"` and let dask size them",
+                                )
+                                .with_url("https://github.com/greensh16/xray-cs/wiki/Dask-Rules#dk010"),
+                        );
+                    }
+                }
+
                 _ => {}
             }
         }
@@ -396,6 +435,24 @@ impl RuleSet for DaskRules {
 
         diags
     }
+}
+
+/// The chunk specification handed to `.rechunk()`.
+///
+/// dask accepts `rechunk(chunks)`, `rechunk(chunks=...)` and per-axis keywords
+/// keyed by integer axis (`rechunk({0: 1})`, which arrives here as a dict and
+/// is classified like any other).
+fn rechunk_spec_node<'t>(
+    call_node: tree_sitter::Node<'t>,
+    source: &[u8],
+) -> Option<tree_sitter::Node<'t>> {
+    if let Some(v) = keyword_arg_value_node(call_node, source, "chunks") {
+        return Some(v);
+    }
+    let args = call_node.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    args.named_children(&mut cursor)
+        .find(|a| a.kind() != "keyword_argument")
 }
 
 #[cfg(test)]
@@ -529,6 +586,49 @@ mod tests {
             "DK009",
             &format!("{IMPORTS}out = da.concatenate(items)\n")
         ));
+    }
+
+    #[test]
+    fn dk010_flags_pathological_rechunk_specs_only() {
+        assert!(fires(
+            "DK010",
+            &format!("{IMPORTS}x = arr.rechunk((1, 1000))\n")
+        ));
+        assert!(fires(
+            "DK010",
+            &format!("{IMPORTS}x = arr.rechunk(chunks=1)\n")
+        ));
+        assert!(fires(
+            "DK010",
+            &format!("{IMPORTS}x = arr.rechunk((2, 4))\n")
+        ));
+        // Ordinary rechunks, and ones xray cannot read, stay silent.
+        assert!(!fires(
+            "DK010",
+            &format!("{IMPORTS}x = arr.rechunk((1000, 1000))\n")
+        ));
+        assert!(!fires(
+            "DK010",
+            &format!("{IMPORTS}x = arr.rechunk(\"auto\")\n")
+        ));
+        assert!(!fires(
+            "DK010",
+            &format!("{IMPORTS}x = arr.rechunk(target)\n")
+        ));
+        // -1 means "one chunk along this axis" — deliberate, not a mistake.
+        assert!(!fires(
+            "DK010",
+            &format!("{IMPORTS}x = arr.rechunk((-1, 500))\n")
+        ));
+    }
+
+    #[test]
+    fn dk008_and_dk010_are_independent_findings_about_one_call() {
+        // Where the rechunk happens and what it asks for are separate
+        // mistakes; a loop that also rechunks to 1 has both.
+        let ids = ids(&format!("{IMPORTS}for p in parts:\n    arr.rechunk(1)\n"));
+        assert!(ids.contains(&"DK008"), "{ids:?}");
+        assert!(ids.contains(&"DK010"), "{ids:?}");
     }
 
     #[test]

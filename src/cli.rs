@@ -77,6 +77,21 @@ pub struct Cli {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Cross-check the Python against an HPC submission script  [env: XRAY_JOB]
+    ///
+    /// Parses `#SBATCH` / `#PBS` directives from the given script and runs the
+    /// JOB rules, which compare the requested allocation against what the
+    /// Python actually does — the cluster it builds, the memory it will need,
+    /// whether it touches the GPU it asked for.
+    ///
+    /// Purely syntactic: the shell is never executed and no variable is
+    /// expanded, so a directive xray cannot read simply produces no finding.
+    ///
+    /// Examples:
+    ///   xray --job run.sh analysis.py
+    #[arg(long, value_name = "SCRIPT", env = "XRAY_JOB")]
+    pub job: Option<String>,
+
     /// Watch for file changes and re-lint automatically
     ///
     /// Performs an initial lint of all matching files, then watches for saves

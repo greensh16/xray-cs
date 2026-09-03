@@ -198,7 +198,7 @@ impl RuleSet for IoRules {
                                 ),
                             )
                             .with_suggestion("Pre-load the full array outside the loop with `data = nc_var[:]`, then index `data[i]`")
-                            .with_url("https://github.com/greensh16/xray/wiki/IO-Rules#io004"),
+                            .with_url("https://github.com/greensh16/xray-cs/wiki/IO-Rules#io004"),
                         );
                     }
                 }

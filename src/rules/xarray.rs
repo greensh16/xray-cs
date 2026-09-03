@@ -9,12 +9,14 @@ use crate::{
     fix::Fix,
     parser,
     parser::{
-        ParsedFile, call_is_from, has_keyword_arg, is_inside_loop, keyword_arg_present_or_unknown,
-        keyword_arg_value, node_text, position,
+        ParsedFile, call_is_from, call_module, has_keyword_arg, is_inside_loop,
+        keyword_arg_present_or_unknown, keyword_arg_value, keyword_arg_value_node, node_text,
+        position,
     },
 };
 
 use super::RuleSet;
+use super::chunks::{ChunkVerdict, classify_chunk_spec};
 
 pub struct XarrayRules;
 
@@ -128,6 +130,12 @@ impl RuleSet for XarrayRules {
                 name: "to-netcdf-without-encoding",
                 severity: Severity::Hint,
                 description: "to_netcdf() called without encoding= — data written as float64 with no compression",
+            },
+            RuleMeta {
+                id: "XR012",
+                name: "pathological-chunk-size",
+                severity: Severity::Warning,
+                description: "A literal chunk length of 1 (or a trivially small literal chunk) in chunks= / .chunk() — millions of tiny tasks",
             },
         ]
     }
@@ -563,12 +571,120 @@ impl RuleSet for XarrayRules {
                     }
                 }
 
+                // XR012 — a pathological literal chunk specification
+                11 if !config.is_disabled("XR012") => {
+                    if let Some(call_node) = query
+                        .capture_index_for_name("xr_chunkspec_call")
+                        .and_then(|i| m.nodes_for_capture_index(i).next())
+                    {
+                        // Alternations in the pattern let tree-sitter surface
+                        // structural matches ahead of predicate filtering, so
+                        // re-check the callee — same guard NP003 needs.
+                        let fn_name = callee_name(call_node, source).unwrap_or("");
+                        if !matches!(
+                            fn_name,
+                            "open_dataset" | "open_mfdataset" | "open_zarr" | "chunk"
+                        ) {
+                            continue;
+                        }
+                        // `.chunk()` is xarray's; the `open_*` loaders are only
+                        // xarray's when the receiver resolves to it. Without
+                        // this, `zarr.open_zarr(...)` and a same-named helper
+                        // on an unrelated object both matched.
+                        if fn_name != "chunk"
+                            && !matches!(
+                                call_module(call_node, source, &file.imports),
+                                Some("xarray") | None
+                            )
+                        {
+                            continue;
+                        }
+                        let Some(spec) = chunk_spec_node(call_node, source, fn_name) else {
+                            continue;
+                        };
+                        let verdict = classify_chunk_spec(spec, source);
+                        let message = match &verdict {
+                            ChunkVerdict::SingletonChunk { dim } => match dim {
+                                Some(d) => format!(
+                                    "chunk length of 1 along `{d}` — one dask task and one filesystem read per index along that dimension"
+                                ),
+                                None => "chunk length of 1 — one dask task and one filesystem read per index along that dimension".to_string(),
+                            },
+                            ChunkVerdict::TriviallySmall { elements } => format!(
+                                "chunk of {elements} elements — the scheduler spends longer dispatching each task than the task spends computing"
+                            ),
+                            ChunkVerdict::Unknown => continue,
+                        };
+                        let (line, col) = position(&spec);
+                        diags.push(
+                            Diagnostic::new("XR012", Severity::Warning, path, line, col, message)
+                                .with_suggestion(
+                                    "Size chunks so each holds at least ~1 M elements (dask's guidance is ≥ 100 MB per chunk); `chunks=\"auto\"` picks a reasonable default",
+                                )
+                                .with_fix_hint("chunks=\"auto\"")
+                                .with_url("https://github.com/greensh16/xray-cs/wiki/xarray-Rules#xr012"),
+                        );
+                    }
+                }
+
                 _ => {}
             }
         }
 
         diags
     }
+}
+
+/// The name of the function being called: the attribute for `a.b()`, the bare
+/// identifier for `b()`.
+fn callee_name<'a>(call_node: tree_sitter::Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    let func = call_node.child_by_field_name("function")?;
+    let name_node = match func.kind() {
+        "attribute" => func.child_by_field_name("attribute")?,
+        "identifier" => func,
+        _ => return None,
+    };
+    Some(node_text(&name_node, source))
+}
+
+/// The node holding the chunk specification for XR012.
+///
+/// `open_*` take it as `chunks=`; `.chunk()` accepts either a single
+/// positional argument or per-dimension keywords, and the keyword spelling
+/// (`ds.chunk(time=1)`) is folded into the same singleton verdict by handing
+/// back the offending value node.
+fn chunk_spec_node<'t>(
+    call_node: tree_sitter::Node<'t>,
+    source: &[u8],
+    fn_name: &str,
+) -> Option<tree_sitter::Node<'t>> {
+    if let Some(v) = keyword_arg_value_node(call_node, source, "chunks") {
+        return Some(v);
+    }
+    if fn_name != "chunk" {
+        return None;
+    }
+    let args = call_node.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    // `ds.chunk({"time": 1})` — first positional argument.
+    for arg in args.named_children(&mut cursor) {
+        if arg.kind() != "keyword_argument" {
+            return Some(arg);
+        }
+    }
+    // `ds.chunk(time=1, lat=180)` — report the first keyword whose value is a
+    // literal 1, since that is the whole of the finding.
+    let mut cursor = args.walk();
+    args.named_children(&mut cursor)
+        .filter(|a| a.kind() == "keyword_argument")
+        .find_map(|a| {
+            let value = a.child_by_field_name("value")?;
+            matches!(
+                classify_chunk_spec(value, source),
+                ChunkVerdict::SingletonChunk { .. }
+            )
+            .then_some(value)
+        })
 }
 
 #[cfg(test)]

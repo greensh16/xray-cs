@@ -91,7 +91,7 @@ exactly the defensive use it exists for.",
 total = ds.sum()  # xray: disable=DK001",
         good_example: "\
 total = ds.sum()",
-        url: Some("https://github.com/greensh16/xray/wiki/Suppressions"),
+        url: Some("https://github.com/greensh16/xray-cs/wiki/Suppressions"),
         fix_eligible: false,
     },
     ExplainEntry {
@@ -743,6 +743,422 @@ ds = xr.open_dataset(\"large.nc\", chunks=\"auto\", engine=\"scipy\")
         good_example: "\
 ds = xr.open_dataset(\"large.nc\", chunks=\"auto\", engine=\"netcdf4\")",
         url: Some("https://docs.xarray.dev/en/stable/generated/xarray.open_dataset.html"),
+        fix_eligible: false,
+    },
+    ExplainEntry {
+        id: "XR012",
+        name: "pathological-chunk-size",
+        severity: "warning",
+        domain: "xarray",
+        rationale: "\
+Array shapes need a runtime, so xray says nothing about whether a chunking is
+well proportioned.  Chunk *arguments* are a different matter: they are literals
+sitting in the source, and a chunk length of 1 is recognisable from the literal
+alone as a mistake.
+
+A chunk of 1 along a dimension means one dask task per index along that axis.
+On a 40-year hourly dataset that is ~350,000 tasks, each carrying roughly a
+millisecond of scheduler overhead and — on a parallel filesystem like Lustre —
+its own metadata round-trip.  The scheduler and the MDS do all the work while
+the compute nodes idle.
+
+The rule also fires on a positional chunk spec whose literal extents multiply
+out to fewer than 64 elements.  A *dict* spec is never judged that way: it
+names the dimensions it constrains and leaves the rest at full extent, so
+chunks={\"time\": 24} is a perfectly ordinary chunk, not a 24-element one.
+
+Anything xray cannot read as a literal — chunks=\"auto\", a variable, -1
+(which means \"one chunk along this axis\", a deliberate instruction) — is
+left alone.",
+        bad_example: "\
+ds = xr.open_dataset(\"era5.nc\", chunks={\"time\": 1})   # one task per hour
+ds = ds.chunk(time=1)                                  # same, method form
+ds = xr.open_dataset(\"era5.nc\", chunks=(2, 4, 4))      # 32-element chunks",
+        good_example: "\
+ds = xr.open_dataset(\"era5.nc\", chunks={\"time\": 24 * 30})   # ~1 chunk/month
+ds = xr.open_dataset(\"era5.nc\", chunks=\"auto\")              # let dask size it
+ds = ds.chunk({\"time\": -1})                                 # deliberate: one chunk",
+        url: Some(
+            "https://docs.xarray.dev/en/stable/user-guide/dask.html#chunking-and-performance",
+        ),
+        fix_eligible: false,
+    },
+    ExplainEntry {
+        id: "DK010",
+        name: "pathological-rechunk",
+        severity: "warning",
+        domain: "dask",
+        rationale: "\
+The same literal-only analysis as XR012, applied to the one dask call whose
+entire purpose is choosing a chunk shape.
+
+rechunk() is not free: it is a full shuffle, moving every block across the
+graph.  Paying that to arrive at chunks of one element is the worst of both —
+the shuffle cost up front, and a task-per-element graph afterwards.
+
+As with XR012, only literals are judged.  A rechunk to a computed shape, to
+\"auto\", or to -1 says nothing.",
+        bad_example: "\
+arr = arr.rechunk((1, 1000))   # a full shuffle, then one task per row
+arr = arr.rechunk(1)           # one task per element, in every dimension",
+        good_example: "\
+arr = arr.rechunk((1000, 1000))   # ~8 MB chunks for float64
+arr = arr.rechunk(\"auto\")         # let dask pick",
+        url: Some("https://docs.dask.org/en/stable/generated/dask.array.rechunk.html"),
+        fix_eligible: false,
+    },
+    // ── pandas ────────────────────────────────────────────────────────────────
+    ExplainEntry {
+        id: "PD001",
+        name: "iterrows-in-loop",
+        severity: "error",
+        domain: "pandas",
+        rationale: "\
+NP001 flags iterrows() wherever it appears.  This is the worse case: the call
+sits inside another loop, so the entire row-by-row Python pass is repeated on
+every outer iteration.  A 10,000-row frame inside a 100-iteration loop is a
+million Python-level row constructions, each one boxing every column value
+into a Series.
+
+Note what does *not* fire: a plain `for i, row in df.iterrows():` at the top
+level.  The call is in the loop header, evaluated once, so it is NP001's
+finding, not this one.",
+        bad_example: "\
+for group in groups:
+    for i, row in df.iterrows():        # the full pass, once per group
+        totals[group] += row[\"value\"]",
+        good_example: "\
+# One vectorised pass over the whole frame.
+totals = df.groupby(\"group\")[\"value\"].sum()",
+        url: Some("https://pandas.pydata.org/docs/user_guide/enhancingperf.html"),
+        fix_eligible: false,
+    },
+    ExplainEntry {
+        id: "PD002",
+        name: "dataframe-append",
+        severity: "error",
+        domain: "pandas",
+        rationale: "\
+DataFrame.append() was deprecated in pandas 1.4 and *removed* in 2.0.  This is
+not a warning you can live with: the call raises AttributeError on any current
+pandas, so the script fails at the point it runs — often hours into a job.
+
+It was also always a performance trap.  Each append allocated a whole new
+frame and copied both operands, making an append loop O(n squared) in time and
+memory.
+
+Because `list.append` is the most common method call in Python, this rule
+fires only when the receiver is a *known* pandas object — one xray watched
+being assigned from `pd.read_csv`, `pd.DataFrame`, and so on.  An unknown
+receiver is left alone, which is the opposite of xray's usual convention and
+deliberately so.",
+        bad_example: "\
+out = pd.DataFrame()
+for f in files:
+    out = out.append(pd.read_csv(f))   # AttributeError on pandas >= 2.0",
+        good_example: "\
+frames = [pd.read_csv(f) for f in files]
+out = pd.concat(frames, ignore_index=True)   # one allocation",
+        url: Some("https://pandas.pydata.org/docs/whatsnew/v2.0.0.html"),
+        fix_eligible: false,
+    },
+    ExplainEntry {
+        id: "PD003",
+        name: "chained-assignment",
+        severity: "error",
+        domain: "pandas",
+        rationale: "\
+`df[a][b] = value` is two operations.  The first, `df[a]`, may return a view
+or a copy — pandas does not promise which — and the assignment then lands on
+whatever that was.  When it is a copy, the write goes into a temporary that is
+discarded on the next line, and the original frame is unchanged.
+
+pandas flags this with SettingWithCopyWarning, which is easy to filter out or
+miss in a job log.  Under copy-on-write, the default from pandas 3.0, it stops
+warning and simply never writes.
+
+NP005 flags the read form of the same chain.  This rule is the form that
+silently loses data.
+
+Nested indexing on a list of lists (`grid[1][2] = 0`) is not affected and is
+not flagged: the rule requires evidence the receiver is a DataFrame, either a
+string column key or a binding xray traced back to pandas.",
+        bad_example: "\
+df[\"temp\"][df[\"temp\"] < 0] = 0    # may write to a copy and vanish",
+        good_example: "\
+df.loc[df[\"temp\"] < 0, \"temp\"] = 0   # one indexer, always writes through",
+        url: Some(
+            "https://pandas.pydata.org/docs/user_guide/indexing.html#returning-a-view-versus-a-copy",
+        ),
+        fix_eligible: false,
+    },
+    ExplainEntry {
+        id: "PD004",
+        name: "read-csv-without-dtype",
+        severity: "hint",
+        domain: "pandas",
+        rationale: "\
+Without dtype=, pandas infers each column's type by scanning the file, then
+usually settles on float64 for numbers and object (a Python str per cell) for
+anything else.  Two costs follow: the inference pass itself, which on a
+multi-GB CSV can dominate the read, and a frame two to ten times larger in
+memory than the data warrants.
+
+Passing dtype= skips inference entirely and gives you the precision you meant.
+Pairing it with usecols= is usually the bigger win again.
+
+The rule stays quiet when the call forwards **kwargs, since dtype may well be
+in there, and it does not fire for dask's or pyarrow's read_csv — their dtype
+handling is a different story.",
+        bad_example: "\
+df = pd.read_csv(\"observations.csv\")   # infers over the whole file",
+        good_example: "\
+df = pd.read_csv(
+    \"observations.csv\",
+    usecols=[\"station\", \"temp\"],
+    dtype={\"station\": \"category\", \"temp\": \"float32\"},
+)",
+        url: Some("https://pandas.pydata.org/docs/reference/api/pandas.read_csv.html"),
+        fix_eligible: false,
+    },
+    ExplainEntry {
+        id: "PD005",
+        name: "to-csv-with-index",
+        severity: "hint",
+        domain: "pandas",
+        rationale: "\
+to_csv() writes the index by default, as a leading column with no header.
+Whatever reads the file next sees a nameless first column and pandas names it
+`Unnamed: 0`, so a round-trip through CSV silently grows a column each time.
+
+For a default RangeIndex the column is pure noise.  For a meaningful index it
+is real data — which is why an explicit `index=True` is treated as a decision
+and left alone.  The rule only fires on the default.",
+        bad_example: "\
+df.to_csv(\"results.csv\")            # leading 0,1,2,... column
+df2 = pd.read_csv(\"results.csv\")    # now has an `Unnamed: 0` column",
+        good_example: "\
+df.to_csv(\"results.csv\", index=False)
+# or, when the index is real data you want to keep:
+df.to_csv(\"results.csv\", index=True)",
+        url: Some("https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.to_csv.html"),
+        fix_eligible: false,
+    },
+    // ── scipy ─────────────────────────────────────────────────────────────────
+    ExplainEntry {
+        id: "SP001",
+        name: "quad-in-loop",
+        severity: "warning",
+        domain: "scipy",
+        rationale: "\
+scipy.integrate.quad is a scalar routine: one function, one interval, one
+number out.  Calling it per element re-enters the Fortran QUADPACK driver
+every iteration, re-allocating its workspace and re-running its adaptive error
+control from scratch — and the Python callback is invoked once per evaluation
+point, so the interpreter overhead is paid tens of times per call.
+
+quad_vec integrates a vector-valued function in a single adaptive pass,
+sharing one subdivision of the interval across all components.  When the
+components have similar structure — the usual case for a parameter sweep —
+this is not a constant-factor win but an asymptotic one, because the expensive
+part (finding where the integrand is difficult) happens once.",
+        bad_example: "\
+results = []
+for k in wavenumbers:
+    val, err = quad(lambda x: f(x, k), 0, np.inf)   # full adaptive pass each time
+    results.append(val)",
+        good_example: "\
+# One adaptive pass; the subdivision is shared across every k.
+results, err = quad_vec(lambda x: f(x, wavenumbers), 0, np.inf)",
+        url: Some(
+            "https://docs.scipy.org/doc/scipy/reference/generated/scipy.integrate.quad_vec.html",
+        ),
+        fix_eligible: false,
+    },
+    ExplainEntry {
+        id: "SP002",
+        name: "explicit-matrix-inverse",
+        severity: "warning",
+        domain: "scipy",
+        rationale: "\
+Forming an inverse to multiply by it is the textbook example of doing linear
+algebra the expensive way.
+
+inv(A) is an LU factorisation followed by n triangular solves, roughly 2n^3/3
++ 2n^3 flops; solve(A, b) is the same factorisation and a single solve, so
+about half the work.  Accuracy is the more serious half of the argument: the
+explicit inverse applies the condition number of A to the result twice, so on
+an ill-conditioned system inv(A) @ b loses roughly twice as many digits as
+solve(A, b) does.
+
+If you need the same A many times, factor once with lu_factor / cho_factor and
+reuse the factorisation — still not the inverse.
+
+Genuine uses for an explicit inverse exist (a covariance matrix you must
+report, for instance).  Suppress the rule on those lines; they are rare enough
+to name individually.",
+        bad_example: "\
+x = scipy.linalg.inv(A) @ b                     # slower and less accurate
+cov = scipy.linalg.inv(hessian) @ grad",
+        good_example: "\
+x = scipy.linalg.solve(A, b)
+
+# Same A, many right-hand sides: factor once.
+lu, piv = scipy.linalg.lu_factor(A)
+xs = [scipy.linalg.lu_solve((lu, piv), b) for b in rhs]",
+        url: Some("https://docs.scipy.org/doc/scipy/reference/generated/scipy.linalg.solve.html"),
+        fix_eligible: false,
+    },
+    // ── HPC job scripts ───────────────────────────────────────────────────────
+    ExplainEntry {
+        id: "JOB001",
+        name: "allocation-cluster-mismatch",
+        severity: "warning",
+        domain: "job",
+        rationale: "\
+Requires --job (or [job].script in xray.toml).
+
+The scheduler gives the job the cores its directives asked for.  Dask uses the
+cores the Python asked for.  Nothing checks that these are the same number,
+and nothing complains at runtime if they are not — the job runs, produces
+correct output, and leaves most of the allocation idle for the full wall time
+while being billed for all of it.
+
+xray compares n_workers x threads_per_worker against --cpus-per-task /
+ncpus=.  Both sides must be readable literals: a shell variable in the
+directive or a computed worker count produces no finding rather than a guess.",
+        bad_example: "\
+#SBATCH --cpus-per-task=48
+...
+cluster = LocalCluster(n_workers=4)   # 44 of 48 cores idle, billed anyway",
+        good_example: "\
+#SBATCH --cpus-per-task=48
+...
+import os
+n = int(os.environ[\"SLURM_CPUS_PER_TASK\"])
+cluster = LocalCluster(n_workers=n, threads_per_worker=1)",
+        url: Some("https://github.com/greensh16/xray-cs/wiki/Job-Rules#job001"),
+        fix_eligible: false,
+    },
+    ExplainEntry {
+        id: "JOB002",
+        name: "unpinned-thread-count",
+        severity: "warning",
+        domain: "job",
+        rationale: "\
+Requires --job (or [job].script in xray.toml).
+
+NumPy's BLAS backend (OpenBLAS, MKL) defaults to one thread per core it can
+see — and on a shared node it sees the whole node, not your allocation.  Every
+dask worker then starts its own BLAS pool, so N workers on a 48-core node can
+request 48 threads each.  The result is thousands of runnable threads
+thrashing the scheduler, and the classic HPC surprise: the parallel job runs
+slower than the serial one.
+
+Either lever silences the rule, because either one fixes it: exporting
+OMP_NUM_THREADS / MKL_NUM_THREADS in the job script, or passing
+threads_per_worker= in Python.  xray does not audit the number, only that a
+decision was made.",
+        bad_example: "\
+#SBATCH --cpus-per-task=48
+# nothing pins the BLAS pool
+cluster = LocalCluster(n_workers=48)   # up to 48 x 48 threads",
+        good_example: "\
+#SBATCH --cpus-per-task=48
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+cluster = LocalCluster(n_workers=48, threads_per_worker=1)",
+        url: Some("https://github.com/greensh16/xray-cs/wiki/Job-Rules#job002"),
+        fix_eligible: false,
+    },
+    ExplainEntry {
+        id: "JOB003",
+        name: "memory-request-unchunked-read",
+        severity: "error",
+        domain: "job",
+        rationale: "\
+Requires --job (or [job].script in xray.toml).
+
+XR001 already says an unchunked open_dataset loads eagerly.  This rule says
+something sharper: the job has a hard memory ceiling, written down two files
+away, and an eager read either fits under it or the scheduler kills the job.
+There is no graceful degradation, and the failure arrives after the queue wait
+rather than at submission.
+
+Reported as an error because it is the one JOB rule whose outcome is a dead
+job rather than a wasted allocation.",
+        bad_example: "\
+#SBATCH --mem=190GB
+...
+ds = xr.open_mfdataset(\"era5_*.nc\")   # eager; OOM-killed if it exceeds 190 GB",
+        good_example: "\
+#SBATCH --mem=190GB
+...
+ds = xr.open_mfdataset(\"era5_*.nc\", chunks={\"time\": 24})   # streams lazily",
+        url: Some("https://github.com/greensh16/xray-cs/wiki/Job-Rules#job003"),
+        fix_eligible: false,
+    },
+    ExplainEntry {
+        id: "JOB004",
+        name: "unused-gpu-allocation",
+        severity: "warning",
+        domain: "job",
+        rationale: "\
+Requires --job (or [job].script in xray.toml).
+
+A GPU node costs several times a CPU node per hour and is usually the
+scarcest queue on the machine.  A job that requests one and never imports a
+library able to use it burns that budget and holds the device away from
+whoever needed it — and nothing in the Python or the job script complains,
+because neither half is wrong on its own.
+
+This is the only rule in xray evaluated across the whole run rather than
+per file: the question is whether *anything* the job launches touches the GPU,
+so a package where model.py imports torch and utils.py does not is fine.  It
+reports once, against the offending directive in the job script.
+
+The GPU-library list is deliberately generous (cupy, torch, tensorflow, jax,
+cudf, ...) — torch has a CPU-only build, but a script importing torch and
+requesting a GPU is not the mistake this rule is looking for.",
+        bad_example: "\
+#SBATCH --gres=gpu:v100:2     # <- reported here
+...
+import numpy as np            # nothing that can reach the device",
+        good_example: "\
+#SBATCH --cpus-per-task=12    # no GPU asked for
+...
+import numpy as np",
+        url: Some("https://github.com/greensh16/xray-cs/wiki/Job-Rules#job004"),
+        fix_eligible: false,
+    },
+    ExplainEntry {
+        id: "JOB005",
+        name: "unbounded-worker-pool",
+        severity: "warning",
+        domain: "job",
+        rationale: "\
+Requires --job (or [job].script in xray.toml).
+
+n_jobs=-1 means \"every core\", and multiprocessing.Pool() with no argument
+means the same.  Both read the *machine's* core count, not the job's
+allocation: cgroups constrain the CPU time those processes get but do not
+change what os.cpu_count() reports.  On a shared node a 4-core job therefore
+spawns 48 workers, which oversubscribes your own allocation and degrades every
+other job on the node.
+
+The rule fires only under a partial-node allocation.  With --exclusive the job
+owns the machine, and taking every core on it is exactly right.",
+        bad_example: "\
+#SBATCH --cpus-per-task=4
+...
+Parallel(n_jobs=-1)(delayed(work)(x) for x in items)   # 48 workers on 4 cores",
+        good_example: "\
+#SBATCH --cpus-per-task=4
+...
+import os
+n = int(os.environ.get(\"SLURM_CPUS_PER_TASK\", 1))
+Parallel(n_jobs=n)(delayed(work)(x) for x in items)",
+        url: Some("https://github.com/greensh16/xray-cs/wiki/Job-Rules#job005"),
         fix_eligible: false,
     },
 ];

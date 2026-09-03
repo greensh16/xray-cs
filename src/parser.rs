@@ -25,6 +25,14 @@ pub struct ImportContext {
     pub netcdf4: bool,
     pub zarr: bool,
     pub h5py: bool,
+    pub scipy: bool,
+    /// Any library that only makes sense on a GPU is imported.
+    ///
+    /// Not a rule domain of its own — JOB004 uses it to answer "was the GPU
+    /// this job asked for ever going to be touched?". Deliberately generous:
+    /// torch and tensorflow have CPU-only builds, but a script that imports
+    /// one and requests a GPU is not the mistake JOB004 exists to catch.
+    pub gpu: bool,
     /// Binding name → canonical top-level module.
     /// `import xarray as xr` → `"xr" → "xarray"`;
     /// `import dask.array as dsa` → `"dsa" → "dask"`;
@@ -158,6 +166,7 @@ impl ImportContext {
     }
 
     fn mark_by_name(ctx: &mut Self, module: &str) {
+        // (see GPU_MODULES below for the `gpu` flag)
         match module {
             "xarray" => ctx.xarray = true,
             "dask" => ctx.dask = true,
@@ -166,10 +175,39 @@ impl ImportContext {
             "netCDF4" | "netcdf4" => ctx.netcdf4 = true,
             "zarr" => ctx.zarr = true,
             "h5py" => ctx.h5py = true,
+            "scipy" => ctx.scipy = true,
             _ => {}
+        }
+        if GPU_MODULES.contains(&module) {
+            ctx.gpu = true;
         }
     }
 }
+
+/// Top-level modules whose presence means the script intends to use a GPU.
+///
+/// Only the leading component of the dotted path is matched, so `import
+/// torch.nn`, `from cupy import asarray` and `import jax.numpy as jnp` all
+/// count. `numba` is deliberately absent: the overwhelming majority of numba
+/// use is `@njit` on the CPU, so treating it as GPU intent would silence
+/// JOB004 on exactly the jobs it exists to catch.
+const GPU_MODULES: &[&str] = &[
+    "cupy",
+    "cupyx",
+    "torch",
+    "tensorflow",
+    "jax",
+    "cudf",
+    "cuml",
+    "cugraph",
+    "cusignal",
+    "cuspatial",
+    "pycuda",
+    "cuda",
+    "pyopencl",
+    "dask_cuda",
+    "rmm",
+];
 
 /// Per-file and per-line inline suppression state, built from
 /// `# xray: disable=RULE_ID` and `# xray: disable-file=RULE_ID` comments.
@@ -392,7 +430,14 @@ pub fn call_module<'a>(
         "identifier" => imports.module_of_name(node_text(&func, source)),
         "attribute" => {
             let root = attribute_root(func.child_by_field_name("object")?, source)?;
-            imports.module_of_binding(root)
+            // `import scipy.integrate as integrate` binds an alias; `from
+            // scipy import integrate` binds a *name*. Both spell the same
+            // call `integrate.quad(...)`, so the second form has to resolve
+            // too — without the fallback every `from <pkg> import <submodule>`
+            // style receiver answered `None`.
+            imports
+                .module_of_binding(root)
+                .or_else(|| imports.module_of_name(root))
         }
         _ => None,
     }

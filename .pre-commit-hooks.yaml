@@ -3,18 +3,19 @@
 # Add to your .pre-commit-config.yaml:
 #
 #   repos:
-#     - repo: https://github.com/greensh16/xray
-#       rev: v1.1.0          # pin to a release tag
+#     - repo: https://github.com/greensh16/xray-cs
+#       rev: v1.2.0          # pin to a release tag
 #       hooks:
 #         - id: xray         # lint all staged Python files
 #
 # The hook passes staged filenames to xray as positional arguments.
-# xray must already be installed and on PATH.  On HPC systems, load it via
-# a module file or install the binary to ~/bin before running pre-commit.
+# xray must already be installed and on PATH (`cargo install xray-cs`, or the
+# binary below).  On HPC systems, load it via a module file or install the
+# binary to ~/bin before running pre-commit.
 #
 # To install the binary (asset names match the release workflow):
 #   curl -sSfL -o ~/.local/bin/xray \
-#     https://github.com/greensh16/xray/releases/latest/download/xray-linux-x86_64
+#     https://github.com/greensh16/xray-cs/releases/latest/download/xray-linux-x86_64
 #   chmod +x ~/.local/bin/xray
 
 - id: xray

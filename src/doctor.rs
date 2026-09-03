@@ -92,14 +92,16 @@ pub fn doctor(path: &str, cli: &Cli, config: &Config) -> Result<()> {
     let imports = &parsed.imports;
 
     println!("\nIMPORTS (top-level only)");
-    let flags: [(&str, bool); 7] = [
+    let flags: [(&str, bool); 9] = [
         ("xarray", imports.xarray),
         ("dask", imports.dask),
         ("numpy", imports.numpy),
         ("pandas", imports.pandas),
+        ("scipy", imports.scipy),
         ("netCDF4", imports.netcdf4),
         ("zarr", imports.zarr),
         ("h5py", imports.h5py),
+        ("a GPU library", imports.gpu),
     ];
     let detected: Vec<&str> = flags
         .iter()
@@ -123,9 +125,11 @@ pub fn doctor(path: &str, cli: &Cli, config: &Config) -> Result<()> {
 
     println!("\nRULE DOMAINS");
     for (domain, gated) in [
-        ("xarray  (XR001–XR011)", imports.xarray),
-        ("dask    (DK001–DK009)", imports.dask),
+        ("xarray  (XR001–XR012)", imports.xarray),
+        ("dask    (DK001–DK010)", imports.dask),
         ("numpy   (NP001–NP007)", imports.numpy || imports.pandas),
+        ("pandas  (PD001–PD005)", imports.pandas),
+        ("scipy   (SP001–SP002)", imports.scipy),
         (
             "io      (IO001–IO006)",
             imports.netcdf4 || imports.zarr || imports.numpy || imports.h5py || imports.xarray,
@@ -139,6 +143,27 @@ pub fn doctor(path: &str, cli: &Cli, config: &Config) -> Result<()> {
                 "skipped (not imported)"
             }
         );
+    }
+
+    // The JOB domain is gated on a file outside the Python, so it gets its own
+    // line rather than an import flag — "skipped (not imported)" would be a
+    // wrong explanation for the most likely reason it did not run.
+    let job_source = cli
+        .job
+        .as_deref()
+        .map(|p| format!("--job {p}"))
+        .or_else(|| {
+            config
+                .job
+                .script
+                .as_deref()
+                .map(|g| format!("[job].script = \"{g}\""))
+        });
+    match job_source {
+        Some(src) => println!("{BULLET} job     (JOB001–JOB005)  RUNS — from {src}"),
+        None => {
+            println!("{BULLET} job     (JOB001–JOB005)  skipped (no --job and no [job].script)")
+        }
     }
 
     if detected.is_empty() {

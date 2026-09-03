@@ -1,6 +1,10 @@
+pub mod chunks;
 pub mod dask;
 pub mod io;
+pub mod job;
 pub mod numpy;
+pub mod pandas;
+pub mod scipy;
 pub mod xarray;
 
 use std::collections::HashSet;
@@ -8,6 +12,7 @@ use std::collections::HashSet;
 use crate::{
     config::Config,
     diagnostic::{Diagnostic, RuleMeta},
+    job::JobScript,
     parser::ParsedFile,
 };
 
@@ -23,7 +28,23 @@ pub trait RuleSet {
 }
 
 /// Run all rule sets against a single parsed file.
+///
+/// The no-job form: equivalent to [`run_all_with_job`] with no submission
+/// script, which is every caller that has no `--job` to hand.
 pub fn run_all(file: &ParsedFile, path: &str, config: &Config) -> Vec<Diagnostic> {
+    run_all_with_job(file, path, config, None)
+}
+
+/// Run all rule sets, optionally cross-checking against a submission script.
+///
+/// `job` is `Some` only when `--job` or `[job].script` resolved to a file; the
+/// JOB rules are the one domain gated on something outside the Python.
+pub fn run_all_with_job(
+    file: &ParsedFile,
+    path: &str,
+    config: &Config,
+    job: Option<&JobScript>,
+) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     // `[per_file_ignores]` is resolved once per file rather than consulted per
     // diagnostic: the globs are fixed for the whole run.
@@ -39,6 +60,12 @@ pub fn run_all(file: &ParsedFile, path: &str, config: &Config) -> Vec<Diagnostic
     if file.imports.numpy || file.imports.pandas {
         out.extend(numpy::NumpyRules::check(file, path, config));
     }
+    if file.imports.pandas {
+        out.extend(pandas::PandasRules::check(file, path, config));
+    }
+    if file.imports.scipy {
+        out.extend(scipy::ScipyRules::check(file, path, config));
+    }
     // IO rules fire whenever any relevant library is imported.  `xarray` is in
     // the list because IO006 inspects `xr.open_dataset(engine=...)`; without it
     // that rule could never fire in a file that imports only xarray.
@@ -49,6 +76,9 @@ pub fn run_all(file: &ParsedFile, path: &str, config: &Config) -> Vec<Diagnostic
         || file.imports.xarray
     {
         out.extend(io::IoRules::check(file, path, config));
+    }
+    if let Some(job) = job {
+        out.extend(job::JobRules::check(file, path, config, job));
     }
 
     // `[per_file_ignores]` — glob-scoped disables.
@@ -62,6 +92,12 @@ pub fn run_all(file: &ParsedFile, path: &str, config: &Config) -> Vec<Diagnostic
     // XR000 can report the ones that did not.
     let mut used: HashSet<(usize, &'static str)> = HashSet::new();
     out.retain(|d| {
+        // A JOB diagnostic reported against the submission script carries that
+        // script's line numbers, which have nothing to do with this Python
+        // file's suppression comments.
+        if d.file != path {
+            return true;
+        }
         if file.suppressions.is_suppressed(d.rule_id, d.line) {
             used.insert((d.line, d.rule_id));
             false
@@ -129,7 +165,7 @@ fn stale_suppressions(
             .with_suggestion(
                 "Remove the `# xray: disable=` comment — the rule it silences no longer fires here",
             )
-            .with_url("https://github.com/greensh16/xray/wiki/Suppressions"),
+            .with_url("https://github.com/greensh16/xray-cs/wiki/Suppressions"),
         );
     }
     out
@@ -146,6 +182,10 @@ const REDUNDANT_WITH: &[(&str, &str)] = &[
     ("XR005", "DK001"),
     ("XR005", "DK002"),
     ("DK001", "DK002"),
+    // v1.2's pandas domain deliberately re-covers two NP rules on a narrower,
+    // worse case. When both land on one position the specific one wins.
+    ("NP001", "PD001"),
+    ("NP005", "PD003"),
 ];
 
 fn drop_redundant(diags: &mut Vec<Diagnostic>) {
@@ -182,6 +222,9 @@ pub fn all_meta() -> Vec<RuleMeta> {
     meta.extend(xarray::XarrayRules::meta());
     meta.extend(dask::DaskRules::meta());
     meta.extend(numpy::NumpyRules::meta());
+    meta.extend(pandas::PandasRules::meta());
+    meta.extend(scipy::ScipyRules::meta());
     meta.extend(io::IoRules::meta());
+    meta.extend(job::JobRules::meta());
     meta
 }

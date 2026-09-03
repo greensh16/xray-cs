@@ -146,7 +146,7 @@ impl RuleSet for NumpyRules {
                                 format!("`{fn_name}()` inside a loop creates O(n²) intermediate copies"),
                             )
                             .with_suggestion("Collect arrays in a list outside the loop, then call `np.concatenate(parts)` once")
-                            .with_url("https://github.com/greensh16/xray/wiki/NumPy-Pandas-Rules#np002"),
+                            .with_url("https://github.com/greensh16/xray-cs/wiki/NumPy-Pandas-Rules#np002"),
                         );
                     }
                 }
@@ -212,7 +212,7 @@ impl RuleSet for NumpyRules {
                                     },
                                 )
                                 .with_suggestion("Add `dtype=np.float32` (or int32, int16 etc.) to match your actual data precision")
-                                .with_url("https://github.com/greensh16/xray/wiki/NumPy-Pandas-Rules#np003"),
+                                .with_url("https://github.com/greensh16/xray-cs/wiki/NumPy-Pandas-Rules#np003"),
                             );
                         }
                     }
@@ -267,7 +267,7 @@ impl RuleSet for NumpyRules {
                             Diagnostic::new("NP004", severity, path, line, col, message)
                                 .with_suggestion(format!("Replace with `np.{fn_name}(array)` to operate on the whole array at once"))
                                 .with_fix_hint(format!("np.{fn_name}(array)"))
-                                .with_url("https://github.com/greensh16/xray/wiki/NumPy-Pandas-Rules#np004");
+                                .with_url("https://github.com/greensh16/xray-cs/wiki/NumPy-Pandas-Rules#np004");
 
                         // Rewrite `math.sqrt` to whatever *this file* calls
                         // numpy. Offering `np.sqrt` in a file that imported

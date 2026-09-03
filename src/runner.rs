@@ -11,6 +11,7 @@ use crate::{
     diagnostic::{Diagnostic, FileResults, RunResults, Severity},
     diff, fix,
     ignore::IgnorePatterns,
+    job::{self, JobScript},
     notebook, parser, rules,
 };
 
@@ -38,17 +39,49 @@ pub fn run(cli: &Cli, config: &Config) -> Result<RunResults> {
 
     let paths = resolve_paths(cli, config, &cli.paths)?;
 
+    // Parsed once for the whole run, not once per file: the submission script
+    // is the same for every Python file it launches.
+    let job_script = job::resolve_job_script(cli.job.as_deref(), config.job.script.as_deref())?;
+    if let Some(ref j) = job_script
+        && !j.has_directives
+    {
+        eprintln!(
+            "xray: warning: {} contains no #SBATCH or #PBS directives — the JOB rules have nothing to check against",
+            j.path
+        );
+    }
+
     // ── Lint files in parallel ────────────────────────────────────────────────
-    let file_results: Vec<_> = paths
+    // Each worker reports whether its file imported a GPU library alongside its
+    // diagnostics: JOB004 is a question about the whole run, not about any one
+    // file, so it cannot be answered inside the per-file pass.
+    let linted: Vec<(FileResults, bool)> = paths
         .par_iter()
         .filter_map(|path| {
             if path.ends_with(".ipynb") {
-                lint_notebook(path, config, cli)
+                lint_notebook(path, config, cli, job_script.as_ref())
             } else {
-                lint_python(path, config, cli)
+                lint_python(path, config, cli, job_script.as_ref())
             }
         })
         .collect();
+
+    let any_gpu_import = linted.iter().any(|(_, gpu)| *gpu);
+    let mut file_results: Vec<FileResults> = linted.into_iter().map(|(f, _)| f).collect();
+
+    // ── JOB004: one finding per run, reported against the job script ──────────
+    if let Some(ref job) = job_script
+        && let Some(diag) = rules::job::job004(any_gpu_import, job, config)
+    {
+        let mut diags = vec![diag];
+        apply_filters(&mut diags, config, cli);
+        if !diags.is_empty() {
+            file_results.push(FileResults {
+                path: job.path.clone(),
+                diagnostics: diags,
+            });
+        }
+    }
 
     let results = RunResults {
         files: file_results,
@@ -108,15 +141,24 @@ pub fn resolve_paths(cli: &Cli, config: &Config, explicit: &[String]) -> Result<
 // ── per-file lint helpers ─────────────────────────────────────────────────────
 
 /// Lint a single `.py` (or other Python) file.
-fn lint_python(path: &str, config: &Config, cli: &Cli) -> Option<FileResults> {
+fn lint_python(
+    path: &str,
+    config: &Config,
+    cli: &Cli,
+    job: Option<&JobScript>,
+) -> Option<(FileResults, bool)> {
     match parser::parse_file(path) {
         Ok(parsed) => {
-            let mut diags = rules::run_all(&parsed, path, config);
+            let mut diags = rules::run_all_with_job(&parsed, path, config, job);
             apply_filters(&mut diags, config, cli);
-            Some(FileResults {
-                path: path.to_string(),
-                diagnostics: diags,
-            })
+            let imports_gpu = parsed.imports.gpu;
+            Some((
+                FileResults {
+                    path: path.to_string(),
+                    diagnostics: diags,
+                },
+                imports_gpu,
+            ))
         }
         Err(e) => {
             eprintln!("xray: could not parse {path}: {e}");
@@ -132,7 +174,12 @@ fn lint_python(path: &str, config: &Config, cli: &Cli) -> Option<FileResults> {
 /// diagnostic's `file` field encodes the cell location (e.g.
 /// `notebook.ipynb:cell[3]`) and its `source_override` holds the cell source
 /// text for use by the ariadne renderer.
-fn lint_notebook(path: &str, config: &Config, cli: &Cli) -> Option<FileResults> {
+fn lint_notebook(
+    path: &str,
+    config: &Config,
+    cli: &Cli,
+    job: Option<&JobScript>,
+) -> Option<(FileResults, bool)> {
     let cells = match notebook::parse_notebook(path) {
         Ok(c) => c,
         Err(e) => {
@@ -142,10 +189,12 @@ fn lint_notebook(path: &str, config: &Config, cli: &Cli) -> Option<FileResults> 
     };
 
     let mut all_diags: Vec<Diagnostic> = Vec::new();
+    let mut imports_gpu = false;
 
     for cell in cells {
         let cell_source = cell.source.clone();
-        let mut diags = rules::run_all(&cell.parsed, &cell.label, config);
+        imports_gpu |= cell.parsed.imports.gpu;
+        let mut diags = rules::run_all_with_job(&cell.parsed, &cell.label, config, job);
 
         // Attach the cell source so `render_text` can display correct context,
         // and restore the real notebook path — a `nb.ipynb:cell[3]` label is
@@ -160,10 +209,13 @@ fn lint_notebook(path: &str, config: &Config, cli: &Cli) -> Option<FileResults> 
         all_diags.extend(diags);
     }
 
-    Some(FileResults {
-        path: path.to_string(),
-        diagnostics: all_diags,
-    })
+    Some((
+        FileResults {
+            path: path.to_string(),
+            diagnostics: all_diags,
+        },
+        imports_gpu,
+    ))
 }
 
 /// Apply config severity overrides, CLI disable list, and min-severity filter
@@ -379,7 +431,7 @@ pub fn build_sarif_json(results: &RunResults) -> Result<String> {
                 "driver": {
                     "name": "xray",
                     "version": env!("CARGO_PKG_VERSION"),
-                    "informationUri": "https://github.com/greensh16/xray",
+                    "informationUri": "https://github.com/greensh16/xray-cs",
                     "rules": rules_arr,
                 }
             },

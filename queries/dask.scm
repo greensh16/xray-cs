@@ -119,3 +119,21 @@
     (#eq? @dk_concatenate_bare "concatenate")
   ]
 ) @dk_concatenate_call
+
+
+; DK010 — .rechunk() to a pathological literal chunk.
+;
+; The same literal-only analysis as XR012, on the one dask call whose whole
+; purpose is to choose a chunk shape. `.rechunk(1)` or `.rechunk((1, 1000))`
+; pays a full shuffle to arrive at a graph with a task per element.
+;
+; Deliberately a separate pattern from DK008 rather than a branch inside it:
+; DK008 is about *where* the rechunk happens and DK010 about *what* it asks
+; for, and both can be true of one call.
+(call
+  function: (attribute
+    attribute: (identifier) @dk_rechunk_spec_method
+    (#eq? @dk_rechunk_spec_method "rechunk")
+  )
+  arguments: (argument_list) @dk_rechunk_spec_args
+) @dk_rechunk_spec_call

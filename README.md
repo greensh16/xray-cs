@@ -1,8 +1,11 @@
 # xray
 
+[![crates.io](https://img.shields.io/crates/v/xray-cs.svg)](https://crates.io/crates/xray-cs)
+
 A fast, self-contained Rust linter for scientific Python workflows on HPC systems.
-Targets **xarray**, **dask**, **NumPy**, **pandas**, and **scientific I/O** patterns
-that general-purpose linters (ruff, pylint) don't cover.
+Targets **xarray**, **dask**, **NumPy**, **pandas**, **SciPy** and **scientific I/O**
+patterns that general-purpose linters (ruff, pylint) don't cover — and reads your
+**HPC submission script** alongside the Python it launches.
 
 **Zero Python runtime required** — ships as a single binary. Runs on Gadi, Setonix,
 or any HPC cluster without loading a Python module.
@@ -11,12 +14,24 @@ or any HPC cluster without loading a Python module.
 
 ## Installation
 
-Download a pre-built binary from the [releases page](https://github.com/greensh16/xray/releases/latest):
+From crates.io:
 
 ```bash
-curl -L https://github.com/greensh16/xray/releases/download/v1.1.0/xray-linux-x86_64 \
+cargo install xray-cs
+```
+
+Or download a pre-built binary from the [releases page](https://github.com/greensh16/xray-cs/releases/latest) —
+no Rust toolchain needed, which is usually what you want on a login node:
+
+```bash
+curl -L https://github.com/greensh16/xray-cs/releases/download/v1.2.0/xray-linux-x86_64 \
   -o ~/.local/bin/xray && chmod +x ~/.local/bin/xray
 ```
+
+> **On the name.** The crate is published as **`xray-cs`** ("xray, climate
+> science") because `xray` was already taken on crates.io by an unrelated 2018
+> crate. Only the registry name differs — the command you run is `xray`, the
+> config file is `xray.toml`, and suppression comments stay `# xray: disable=`.
 
 ---
 
@@ -76,10 +91,10 @@ to report without ever failing.
 
 ## Rules
 
-34 rules across four domains plus one cross-domain check. All IDs are stable.
-The **Fix** column marks rules `xray fix` can rewrite mechanically.
-`xray --list-rules` prints this table; `xray explain <ID>` gives the rationale,
-a bad/good example pair, and links to upstream docs.
+47 rules across six library domains and the HPC job-script domain, plus one
+cross-domain check. All IDs are stable. The **Fix** column marks rules `xray fix`
+can rewrite mechanically. `xray --list-rules` prints this table; `xray explain
+<ID>` gives the rationale, a bad/good example pair, and links to upstream docs.
 
 ### XR — xarray
 
@@ -96,6 +111,7 @@ a bad/good example pair, and links to upstream docs.
 | XR009 | warning | ✓ | apply_ufunc with dask='allowed' silently falls back to serial execution; use dask='parallelized' |
 | XR010 | warning |  | xr.merge called inside a for loop — O(n²) cost; collect datasets then merge once |
 | XR011 | hint |  | to_netcdf() called without encoding= — data written as float64 with no compression |
+| XR012 | warning |  | A literal chunk length of 1 (or a trivially small literal chunk) in chunks= / .chunk() — millions of tiny tasks |
 
 ### DK — Dask
 
@@ -110,6 +126,7 @@ a bad/good example pair, and links to upstream docs.
 | DK007 | warning | ✓ | da.from_array() called without chunks= — creates a single-chunk array that defeats dask parallelism |
 | DK008 | warning |  | .rechunk() called inside a for loop — triggers a full graph materialisation on every iteration |
 | DK009 | error |  | da.concatenate() inside a for loop — O(n²) intermediate copies; collect arrays then concatenate once |
+| DK010 | warning |  | .rechunk() to a literal chunk of 1 or a trivially small chunk — pays a full shuffle to arrive at a task per element |
 
 ### NP — NumPy / pandas
 
@@ -123,6 +140,23 @@ a bad/good example pair, and links to upstream docs.
 | NP006 | warning | ✓ | np.matrix() is deprecated since NumPy 1.16 — use np.array() / np.ndarray instead |
 | NP007 | warning | ✓ | DataFrame.applymap() is deprecated (use .map()), or .apply(lambda) inside a loop |
 
+### PD — pandas
+
+| ID | Default | Fix | Description |
+|----|---------|-----|-------------|
+| PD001 | error |  | DataFrame.iterrows() inside an enclosing loop — row-by-row Python iteration repeated every outer iteration |
+| PD002 | error |  | DataFrame.append() was removed in pandas 2.0 — use pd.concat() |
+| PD003 | error |  | Chained assignment df[...][...] = ... — writes to a temporary copy; use .loc / .iloc |
+| PD004 | hint |  | pd.read_csv() without dtype= — forces a type-inference pass over the whole file |
+| PD005 | hint |  | .to_csv() without index=False — writes a spurious index column that reappears as `Unnamed: 0` |
+
+### SP — SciPy
+
+| ID | Default | Fix | Description |
+|----|---------|-----|-------------|
+| SP001 | warning |  | scipy.integrate.quad() inside a loop — use quad_vec() for one adaptive pass over the whole vector |
+| SP002 | warning |  | scipy.linalg.inv() — prefer solve(); an explicit inverse is slower and numerically inferior |
+
 ### IO — Scientific I/O
 
 | ID | Default | Fix | Description |
@@ -133,6 +167,20 @@ a bad/good example pair, and links to upstream docs.
 | IO004 | warning |  | netCDF4 variable subscripted inside a loop — each read may hit disk; pre-load outside the loop |
 | IO005 | hint |  | h5py.File opened without swmr=True — consider SWMR mode for concurrent HPC read workflows |
 | IO006 | warning |  | xr.open_dataset called with engine='scipy' — loads eagerly without chunking; use 'netcdf4' or 'zarr' |
+
+### JOB — HPC job scripts
+
+Opt-in: these run only when a submission script is supplied with `--job
+<script>` or `[job].script` in `xray.toml`. They compare the resource
+request against what the Python actually does.
+
+| ID | Default | Fix | Description |
+|----|---------|-----|-------------|
+| JOB001 | warning |  | Allocated cores do not match the dask cluster the script builds — most of the allocation idles for the full wall time |
+| JOB002 | warning |  | Multi-core request with no thread-count control — BLAS threads multiply by workers and oversubscribe the node |
+| JOB003 | error |  | A memory request paired with an unchunked open_dataset/open_mfdataset — the OOM is predictable before the job is queued |
+| JOB004 | warning |  | A GPU was requested by a script that imports no GPU library — the allocation is billed and idle |
+| JOB005 | warning |  | n_jobs=-1 or an unbounded pool under a partial-node allocation — takes cores belonging to other jobs |
 
 ### Cross-domain
 
@@ -175,7 +223,7 @@ Environment variables: `XRAY_CONFIG`, `XRAY_FORMAT`, `XRAY_MIN_SEVERITY`, `XRAY_
 | Flag | Use case |
 |------|----------|
 | `--format text` | Human-readable terminal output (default) |
-| `--format json` | Versioned JSON envelope — see [JSON schema docs](https://github.com/greensh16/xray/wiki/JSON-Output-Schema) |
+| `--format json` | Versioned JSON envelope — see [JSON schema docs](https://github.com/greensh16/xray-cs/wiki/JSON-Output-Schema) |
 | `--format sarif` | GitHub Code Scanning / any SARIF 2.1.0 consumer |
 | `--format gitlab-codequality` | GitLab CI Code Quality report |
 
@@ -183,13 +231,13 @@ Environment variables: `XRAY_CONFIG`, `XRAY_FORMAT`, `XRAY_MIN_SEVERITY`, `XRAY_
 
 ## Documentation
 
-Full documentation lives on the [GitHub Wiki](https://github.com/greensh16/xray/wiki):
+Full documentation lives on the [GitHub Wiki](https://github.com/greensh16/xray-cs/wiki):
 
-- [Rule reference](https://github.com/greensh16/xray/wiki/Rule-Reference) — rationale, examples, and fix hints for all 34 rules
-- [Configuration guide](https://github.com/greensh16/xray/wiki/Configuration) — full `xray.toml` schema
-- [JSON output schema](https://github.com/greensh16/xray/wiki/JSON-Output-Schema) — stable v1 field reference
-- [HPC deployment cookbook](https://github.com/greensh16/xray/wiki/HPC-Deployment-Cookbook) — Gadi, Setonix, PBS, Slurm
-- [Case studies](https://github.com/greensh16/xray/wiki/Case-Studies) — real-world performance regressions caught by xray
+- [Rule reference](https://github.com/greensh16/xray-cs/wiki/Rule-Reference) — rationale, examples, and fix hints for all 34 rules
+- [Configuration guide](https://github.com/greensh16/xray-cs/wiki/Configuration) — full `xray.toml` schema
+- [JSON output schema](https://github.com/greensh16/xray-cs/wiki/JSON-Output-Schema) — stable v1 field reference
+- [HPC deployment cookbook](https://github.com/greensh16/xray-cs/wiki/HPC-Deployment-Cookbook) — Gadi, Setonix, PBS, Slurm
+- [Case studies](https://github.com/greensh16/xray-cs/wiki/Case-Studies) — real-world performance regressions caught by xray
 
 ---
 

@@ -4,6 +4,7 @@ use xray::{
     diff,
     ignore::IgnorePatterns,
     lsp, parser, rules,
+    rules::RuleSet,
     runner::{JSON_SCHEMA_VERSION, build_gitlab_json, build_json, build_sarif_json},
 };
 
@@ -14,6 +15,27 @@ fn check_fixture(filename: &str) -> Vec<xray::diagnostic::Diagnostic> {
     let mut diags = rules::run_all(&parsed, &path, &config);
     diags.sort_by_key(|d| (d.line, d.rule_id));
     diags
+}
+
+/// Cross-check a Python fixture against a submission-script fixture, as
+/// `xray --job <script> <python>` does.
+///
+/// JOB004 is a run-level rule and so is not produced by `run_all_with_job`;
+/// it is asserted separately through `rules::job::job004`.
+fn check_job_fixture(python: &str, script: &str) -> Vec<xray::diagnostic::Diagnostic> {
+    let py_path = format!("tests/fixtures/{python}");
+    let sh_path = format!("tests/fixtures/{script}");
+    let parsed = parser::parse_file(&py_path).expect("fixture should parse");
+    let job = xray::job::parse_job_file(&sh_path).expect("job script should parse");
+    let config = Config::default();
+    let mut diags = rules::run_all_with_job(&parsed, &py_path, &config, Some(&job));
+    diags.sort_by_key(|d| (d.line, d.rule_id));
+    diags
+}
+
+/// Every rule ID in a diagnostic list, for the v1.2 domain assertions.
+fn rule_ids(diags: &[xray::diagnostic::Diagnostic]) -> Vec<&'static str> {
+    diags.iter().map(|d| d.rule_id).collect()
 }
 
 // ── xarray ────────────────────────────────────────────────────────────────────
@@ -252,18 +274,13 @@ fn disable_rule_via_config() {
     let path = "tests/fixtures/xarray_bad.py";
     let parsed = parser::parse_file(path).unwrap();
 
+    // Every rule the xarray domain owns, taken from the metadata rather than
+    // hand-listed: the hand-listed form silently stopped covering the domain
+    // the moment XR012 was added.
     let mut config = Config::default();
-    config.disable.insert("XR001".to_string());
-    config.disable.insert("XR002".to_string());
-    config.disable.insert("XR003".to_string());
-    config.disable.insert("XR004".to_string());
-    config.disable.insert("XR005".to_string());
-    config.disable.insert("XR006".to_string());
-    config.disable.insert("XR007".to_string());
-    config.disable.insert("XR008".to_string());
-    config.disable.insert("XR009".to_string());
-    config.disable.insert("XR010".to_string());
-    config.disable.insert("XR011".to_string());
+    for meta in xray::rules::xarray::XarrayRules::meta() {
+        config.disable.insert(meta.id.to_string());
+    }
 
     let diags = rules::run_all(&parsed, path, &config);
     assert!(
@@ -1027,8 +1044,10 @@ fn dk002_diagnostic_has_url() {
     assert!(!dk002.is_empty(), "DK002 should fire on dask_bad.py");
     for d in &dk002 {
         assert!(d.url.is_some(), "DK002 diagnostic should carry a docs URL");
+        // Compared case-insensitively: GitHub lowercases wiki heading anchors,
+        // so the link has to be `...#dk002` to actually resolve.
         assert!(
-            d.url.unwrap().contains("DK002"),
+            d.url.unwrap().to_ascii_uppercase().contains("DK002"),
             "DK002 URL should reference the rule ID"
         );
     }
@@ -2179,4 +2198,167 @@ fn xr000_can_itself_be_disabled() {
             .iter()
             .any(|d| d.rule_id == "XR000")
     );
+}
+
+// ── pandas (v1.2) ─────────────────────────────────────────────────────────────
+
+#[test]
+fn pandas_fixture_fires_every_pd_rule() {
+    let diags = check_fixture("pandas_bad.py");
+    let ids = rule_ids(&diags);
+    for rule in ["PD001", "PD002", "PD003", "PD004", "PD005"] {
+        assert!(ids.contains(&rule), "expected {rule} in {ids:?}");
+    }
+}
+
+#[test]
+fn pd001_supersedes_np001_at_the_same_call() {
+    // Both rules match a nested iterrows(); only the specific one survives.
+    let diags = check_fixture("pandas_bad.py");
+    let pd001 = diags.iter().find(|d| d.rule_id == "PD001").unwrap();
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.rule_id == "NP001" && d.line == pd001.line && d.column == pd001.column),
+        "NP001 should be dropped where PD001 fires"
+    );
+}
+
+#[test]
+fn pd003_supersedes_np005_at_the_same_chain() {
+    let diags = check_fixture("pandas_bad.py");
+    let pd003 = diags.iter().find(|d| d.rule_id == "PD003").unwrap();
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.rule_id == "NP005" && d.line == pd003.line && d.column == pd003.column),
+    );
+}
+
+#[test]
+fn pd002_does_not_fire_for_list_append_in_the_clean_fixture() {
+    let ids = rule_ids(&check_fixture("clean.py"));
+    assert!(!ids.contains(&"PD002"), "list.append must never be PD002");
+}
+
+// ── scipy (v1.2) ──────────────────────────────────────────────────────────────
+
+#[test]
+fn scipy_fixture_fires_both_sp_rules() {
+    let ids = rule_ids(&check_fixture("scipy_bad.py"));
+    assert!(ids.contains(&"SP001"), "{ids:?}");
+    assert!(ids.contains(&"SP002"), "{ids:?}");
+}
+
+// ── pathological chunks (v1.2) ────────────────────────────────────────────────
+
+#[test]
+fn xr012_flags_singleton_chunks_in_the_xarray_fixture() {
+    let diags = check_fixture("xarray_bad.py");
+    let xr012: Vec<_> = diags.iter().filter(|d| d.rule_id == "XR012").collect();
+    assert_eq!(
+        xr012.len(),
+        2,
+        "expected the chunks={{time: 1}} and .chunk(time=1) forms"
+    );
+    assert!(xr012[0].message.contains("time"), "{}", xr012[0].message);
+}
+
+#[test]
+fn dk010_flags_the_pathological_rechunk_in_the_dask_fixture() {
+    let ids = rule_ids(&check_fixture("dask_bad.py"));
+    assert!(ids.contains(&"DK010"), "{ids:?}");
+}
+
+#[test]
+fn clean_fixture_has_no_chunk_findings() {
+    // clean.py chunks sensibly throughout — the most important false-positive
+    // guard for a rule that reads ordinary chunk specifications.
+    let ids = rule_ids(&check_fixture("clean.py"));
+    assert!(!ids.contains(&"XR012"), "{ids:?}");
+    assert!(!ids.contains(&"DK010"), "{ids:?}");
+}
+
+// ── HPC job scripts (v1.2) ────────────────────────────────────────────────────
+
+#[test]
+fn job_fixture_fires_every_per_file_job_rule() {
+    let diags = check_job_fixture("job_bad.py", "job_bad.sh");
+    let ids = rule_ids(&diags);
+    for rule in ["JOB001", "JOB002", "JOB003", "JOB005"] {
+        assert!(ids.contains(&rule), "expected {rule} in {ids:?}");
+    }
+}
+
+#[test]
+fn job004_fires_once_for_the_run_against_the_job_script() {
+    let job = xray::job::parse_job_file("tests/fixtures/job_bad.sh").unwrap();
+    let diag = xray::rules::job::job004(false, &job, &Config::default())
+        .expect("a GPU was requested and nothing imports one");
+    assert_eq!(diag.rule_id, "JOB004");
+    assert_eq!(diag.file, "tests/fixtures/job_bad.sh");
+    // Points at the --gres directive, not at the Python.
+    assert_eq!(diag.line, 5);
+}
+
+#[test]
+fn job_rules_are_silent_on_a_matching_allocation() {
+    let diags = check_job_fixture("job_clean.py", "job_clean.sh");
+    let job_diags: Vec<_> = diags
+        .iter()
+        .filter(|d| d.rule_id.starts_with("JOB"))
+        .map(|d| d.rule_id)
+        .collect();
+    assert!(job_diags.is_empty(), "expected none, got {job_diags:?}");
+}
+
+#[test]
+fn job_rules_do_not_fire_without_a_job_script() {
+    // The whole domain is opt-in: no --job, no JOB diagnostics, even on the
+    // fixture built to trigger every one of them.
+    let ids = rule_ids(&check_fixture("job_bad.py"));
+    assert!(
+        !ids.iter().any(|id| id.starts_with("JOB")),
+        "JOB rules must be gated on --job: {ids:?}"
+    );
+}
+
+#[test]
+fn job_rules_stay_quiet_when_a_directive_cannot_be_read() {
+    // `--cpus-per-task=$NCPUS` needs a shell. xray has none and must not guess.
+    let job = xray::job::parse_job_source(
+        "#SBATCH --cpus-per-task=$NCPUS\n#SBATCH --mem=$MEM\n",
+        "run.sh",
+    );
+    let parsed = parser::parse_file("tests/fixtures/job_bad.py").unwrap();
+    let diags = rules::run_all_with_job(
+        &parsed,
+        "tests/fixtures/job_bad.py",
+        &Config::default(),
+        Some(&job),
+    );
+    let job_ids: Vec<_> = diags
+        .iter()
+        .map(|d| d.rule_id)
+        .filter(|id| id.starts_with("JOB"))
+        .collect();
+    assert!(job_ids.is_empty(), "expected none, got {job_ids:?}");
+}
+
+#[test]
+fn every_v12_rule_is_listed_and_explained() {
+    let meta = rules::all_meta();
+    let ids: Vec<&str> = meta.iter().map(|m| m.id).collect();
+    for rule in [
+        "XR012", "DK010", "PD001", "PD002", "PD003", "PD004", "PD005", "SP001", "SP002", "JOB001",
+        "JOB002", "JOB003", "JOB004", "JOB005",
+    ] {
+        assert!(ids.contains(&rule), "{rule} missing from --list-rules");
+        assert!(
+            xray::explain::entry_for(rule).is_some(),
+            "{rule} has no `xray explain` entry"
+        );
+    }
+    // The roadmap's v1.2 target: 33 rules grow to 47, plus cross-domain XR000.
+    assert_eq!(meta.len(), 48, "rule count changed: {ids:?}");
 }

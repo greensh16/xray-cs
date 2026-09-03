@@ -56,3 +56,8 @@ ds.to_netcdf("output.nc")
 
 # This is fine — encoding specified
 ds.to_netcdf("output_compressed.nc", encoding={"u10": {"dtype": "float32", "zlib": True}})
+
+# XR012 — a chunk length of 1: one task, and one Lustre metadata round-trip,
+# per index along `time`.
+ds_singleton = xr.open_dataset("era5.nc", chunks={"time": 1, "lat": 181})
+ds_rechunked = ds_singleton.chunk(time=1)
