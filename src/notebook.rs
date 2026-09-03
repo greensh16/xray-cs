@@ -9,6 +9,7 @@
 //! cell 1 correctly gates xarray rules in cell 5.
 
 use anyhow::Result;
+use rayon::prelude::*;
 use serde_json::Value;
 
 use crate::parser::{self, ImportContext, ParsedFile};
@@ -43,41 +44,54 @@ pub fn parse_notebook(path: &str) -> Result<Vec<NotebookCell>> {
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("notebook {path}: missing top-level 'cells' array"))?;
 
-    let mut notebook_cells: Vec<NotebookCell> = Vec::new();
+    // Pass 1 — pull out the code cells. Cheap, sequential, and it fixes the
+    // 1-based code-cell numbering before anything runs concurrently.
+    let mut pending: Vec<(usize, String, String)> = Vec::new();
     let mut code_cell_index = 0usize;
-
     for cell in cells {
         // Only lint code cells — skip markdown and raw cells.
         if cell["cell_type"].as_str() != Some("code") {
             continue;
         }
         code_cell_index += 1;
+        let cleaned = strip_magics(&extract_cell_source(&cell["source"]));
+        let label = format!("{path}:cell[{code_cell_index}]");
+        pending.push((code_cell_index, label, cleaned));
+    }
 
-        let raw_source = extract_cell_source(&cell["source"]);
-        let cleaned = strip_magics(&raw_source);
-        let label = format!("{}:cell[{}]", path, code_cell_index);
-
-        match parser::parse_source(cleaned.clone()) {
-            Ok(parsed) => {
-                notebook_cells.push(NotebookCell {
-                    index: code_cell_index,
+    // Pass 2 — parse cells in parallel. Each cell is an independent
+    // tree-sitter parse over its own source, so there is nothing to share;
+    // `collect` into a Vec preserves input order regardless of completion
+    // order, which keeps diagnostics and the merge below deterministic.
+    let mut notebook_cells: Vec<NotebookCell> = pending
+        .into_par_iter()
+        .filter_map(
+            |(index, label, cleaned)| match parser::parse_source(cleaned.clone()) {
+                Ok(parsed) => Some(NotebookCell {
+                    index,
                     label,
                     source: cleaned,
                     parsed,
-                });
-            }
-            Err(e) => {
-                // A cell that fails to parse (e.g. syntax error) is skipped
-                // with a warning rather than aborting the whole notebook.
-                eprintln!("xray: could not parse {label}: {e}");
-            }
-        }
-    }
+                }),
+                Err(e) => {
+                    // A cell that fails to parse (e.g. a syntax error) is skipped
+                    // with a warning rather than aborting the whole notebook.
+                    eprintln!("xray: could not parse {label}: {e}");
+                    None
+                }
+            },
+        )
+        .collect();
 
-    // Merge import contexts so that `import xarray` in cell 1 enables xarray
-    // rules in cell 5.  We overwrite every cell's context with the union.
+    // A notebook is one namespace: `import xarray as xr` in cell 1 must gate
+    // the xarray rules *and* resolve `xr.` receivers in cell 5. Merging is
+    // sequential and in cell order so the result never depends on which cell
+    // finished parsing first.
     if notebook_cells.len() > 1 {
-        let merged = merge_imports(&notebook_cells);
+        let mut merged = ImportContext::default();
+        for cell in &notebook_cells {
+            merged.merge_from(&cell.parsed.imports);
+        }
         for cell in &mut notebook_cells {
             cell.parsed.imports = merged.clone();
         }
@@ -87,22 +101,6 @@ pub fn parse_notebook(path: &str) -> Result<Vec<NotebookCell>> {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
-
-/// Build an `ImportContext` that is the logical OR of all cells' import flags.
-fn merge_imports(cells: &[NotebookCell]) -> ImportContext {
-    let mut merged = ImportContext::default();
-    for cell in cells {
-        let i = &cell.parsed.imports;
-        merged.xarray |= i.xarray;
-        merged.dask |= i.dask;
-        merged.numpy |= i.numpy;
-        merged.pandas |= i.pandas;
-        merged.netcdf4 |= i.netcdf4;
-        merged.zarr |= i.zarr;
-        merged.h5py |= i.h5py;
-    }
-    merged
-}
 
 /// Extract the source string from a cell's `"source"` field, which can be
 /// either a plain string (some nbformat versions) or an array of line strings

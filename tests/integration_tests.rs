@@ -1047,7 +1047,11 @@ fn dk002_diagnostic_has_url() {
         // Compared case-insensitively: GitHub lowercases wiki heading anchors,
         // so the link has to be `...#dk002` to actually resolve.
         assert!(
-            d.url.unwrap().to_ascii_uppercase().contains("DK002"),
+            d.url
+                .as_deref()
+                .unwrap()
+                .to_ascii_uppercase()
+                .contains("DK002"),
             "DK002 URL should reference the rule ID"
         );
     }
@@ -2361,4 +2365,82 @@ fn every_v12_rule_is_listed_and_explained() {
     }
     // The roadmap's v1.2 target: 33 rules grow to 47, plus cross-domain XR000.
     assert_eq!(meta.len(), 48, "rule count changed: {ids:?}");
+}
+
+// ── notebooks ─────────────────────────────────────────────────────────────────
+
+/// Lint every code cell of a notebook fixture, as `runner::lint_notebook` does.
+fn check_notebook_fixture(filename: &str) -> Vec<(usize, &'static str)> {
+    let path = format!("tests/fixtures/{filename}");
+    let cells = xray::notebook::parse_notebook(&path).expect("notebook should parse");
+    let config = Config::default();
+    let mut out: Vec<(usize, &'static str)> = Vec::new();
+    for cell in &cells {
+        for d in rules::run_all(&cell.parsed, &cell.label, &config) {
+            out.push((cell.index, d.rule_id));
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn notebook_imports_cross_cell_boundaries() {
+    // The regression this fixture exists for: cell 1 holds the imports and
+    // every later cell depends on them, both for the domain gate *and* for
+    // alias resolution (`xr.` → xarray, `np.` → numpy, `integrate.` → scipy).
+    //
+    // `merge_imports` used to copy only the boolean domain flags, leaving the
+    // alias maps empty in every cell but the one containing the import — so
+    // every rule that resolves a call through `call_module` was silently dead
+    // in notebooks while the identical code in a `.py` file reported normally.
+    let found = check_notebook_fixture("notebook_bad.ipynb");
+    assert!(
+        found.contains(&(2, "XR007")),
+        "XR007 needs `xr` from cell 1 to resolve to xarray; got {found:?}"
+    );
+    assert!(
+        found.contains(&(3, "NP003")),
+        "NP003 needs `np` from cell 1 to resolve to numpy; got {found:?}"
+    );
+    assert!(
+        found.contains(&(4, "SP001")),
+        "SP001 needs both the scipy flag and the `integrate` alias from cell 1; got {found:?}"
+    );
+}
+
+#[test]
+fn notebook_skips_markdown_and_preserves_line_numbers() {
+    let path = "tests/fixtures/notebook_bad.ipynb";
+    let cells = xray::notebook::parse_notebook(path).unwrap();
+    // Four code cells; the leading markdown cell is not one of them.
+    assert_eq!(cells.len(), 4, "markdown cells must not be linted");
+    assert_eq!(cells[0].index, 1);
+
+    // Magic lines are blanked, not removed, so intra-cell line numbers still
+    // point at the right source line.
+    let config = Config::default();
+    let cell3 = &cells[2];
+    let np003 = rules::run_all(&cell3.parsed, &cell3.label, &config)
+        .into_iter()
+        .find(|d| d.rule_id == "NP003")
+        .expect("NP003 in cell 3");
+    assert_eq!(
+        np003.line, 2,
+        "`!pip install` on line 1 must still occupy a line"
+    );
+}
+
+#[test]
+fn notebook_cell_parsing_is_deterministic_under_parallelism() {
+    // Cells are parsed with rayon; `collect` must preserve input order, and
+    // the import merge must not depend on which cell finished first.
+    let first = check_notebook_fixture("notebook_bad.ipynb");
+    for _ in 0..10 {
+        assert_eq!(
+            check_notebook_fixture("notebook_bad.ipynb"),
+            first,
+            "notebook results must be stable across runs"
+        );
+    }
 }

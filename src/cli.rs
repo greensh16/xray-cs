@@ -102,6 +102,30 @@ pub struct Cli {
     ///   xray --watch src/
     #[arg(long)]
     pub watch: bool,
+
+    /// Ignore the persistent results cache for this run
+    ///
+    /// xray caches each file's findings in `.xray-cache`, keyed on the file's
+    /// mtime and size plus a fingerprint of the version, config and job
+    /// script. Unchanged files are neither re-parsed nor re-checked.
+    ///
+    /// Pass this when you suspect the cache is wrong — a write that preserved
+    /// both mtime and size is invisible to it — or to time a cold run. The
+    /// cache is still rewritten afterwards; use `xray clean` to delete it.
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// Number of worker threads  [env: XRAY_JOBS]
+    ///
+    /// Defaults to one per available core. `-j 1` lints serially, which makes
+    /// diagnostic ordering deterministic across runs and is the setting to use
+    /// when profiling.
+    ///
+    /// On a shared HPC login node the default sees every core on the machine,
+    /// not your share of it — the same trap JOB005 reports for `n_jobs=-1`.
+    /// Pass `-j $SLURM_CPUS_PER_TASK` (or `$NCPUS` under PBS) there.
+    #[arg(long, short = 'j', value_name = "N", env = "XRAY_JOBS")]
+    pub jobs: Option<usize>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -174,6 +198,12 @@ pub enum XrayCommand {
         /// File to diagnose
         path: String,
     },
+
+    /// Delete the persistent results cache (`.xray-cache`)
+    ///
+    /// Equivalent to removing the file by hand. `xray --no-cache` bypasses the
+    /// cache for one run without deleting it.
+    Clean,
 
     /// Print shell completion script to stdout
     ///

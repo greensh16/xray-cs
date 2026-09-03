@@ -16,8 +16,28 @@ fn load_config(cli: &cli::Cli) -> Config {
     })
 }
 
+/// Apply `--jobs` / `XRAY_JOBS` to rayon's global pool.
+///
+/// Must run before the first `par_iter`, since the pool is built once on first
+/// use and cannot be reconfigured afterwards. A failure here is not fatal: the
+/// lint is still correct with the default pool, so it warns and continues.
+fn configure_thread_pool(jobs: Option<usize>) {
+    let Some(n) = jobs else { return };
+    if n == 0 {
+        eprintln!("xray: --jobs must be at least 1; using the default thread count");
+        return;
+    }
+    if let Err(e) = rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .build_global()
+    {
+        eprintln!("xray: could not set thread count to {n}: {e}");
+    }
+}
+
 fn main() {
     let cli = cli::parse();
+    configure_thread_pool(cli.jobs);
 
     match &cli.command {
         // ── xray explain <RULE_ID> ────────────────────────────────────────────
@@ -65,6 +85,21 @@ fn main() {
             if let Err(e) = doctor::doctor(path, &cli, &config) {
                 eprintln!("xray: {e}");
                 std::process::exit(2);
+            }
+        }
+
+        // ── xray clean ────────────────────────────────────────────────────────
+        Some(cli::XrayCommand::Clean) => {
+            let path = std::path::Path::new(xray::cache::CACHE_FILE);
+            match std::fs::remove_file(path) {
+                Ok(()) => println!("xray: removed {}", path.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    println!("xray: no {} to remove", path.display());
+                }
+                Err(e) => {
+                    eprintln!("xray: could not remove {}: {e}", path.display());
+                    std::process::exit(2);
+                }
             }
         }
 

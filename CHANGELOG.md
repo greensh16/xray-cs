@@ -9,6 +9,96 @@ xray uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — v1.3 performance milestone (in progress)
+
+- **Persistent results cache (`.xray-cache`).** Unchanged files are neither
+  re-read, re-parsed nor re-checked. Keyed on each file's `(mtime, size)` plus
+  a fingerprint of the xray version, the resolved config and the job script;
+  any fingerprint change discards the whole cache rather than invalidating
+  selectively. Measured **17× faster** on a re-run over a clean 60 k-line
+  corpus (154 ms → 9 ms), **3.4×** on a violation-dense one.
+
+  `--no-cache` bypasses it for a run; `xray clean` deletes it. Add
+  `.xray-cache` to `.gitignore`.
+
+  *Note on scope:* the roadmap asked for cached tree-sitter **parse trees**.
+  That is not implementable — `tree_sitter::Tree` has no serialisation in the
+  Rust binding — and would not help anyway, since every file is already parsed
+  exactly once per run. Caching diagnostics skips strictly more work.
+  Notebooks are deliberately not cached; their diagnostics carry the cell
+  source the renderer needs.
+
+- **`--jobs` / `-j`** (env `XRAY_JOBS`) overrides the rayon thread count.
+  `-j 1` lints serially. On a shared HPC login node the default sees every
+  core on the machine rather than your share of it — the same trap JOB005
+  reports — so pass `-j $SLURM_CPUS_PER_TASK` there.
+
+- **Parallel notebook cell parsing.** Cells within a notebook are parsed with
+  rayon instead of sequentially. Ordering is preserved, so results are
+  unchanged.
+
+- **Rule-level benchmarks.** `cargo bench` now measures each rule domain's
+  throughput separately against a 50 k-line synthetic corpus
+  (`benches/corpus.rs`), plus the whole parse-and-check pipeline.
+
+- **Performance guard in CI** (`tests/perf_guard.rs`, `cargo test --release
+  --test perf_guard -- --ignored`). Deliberately a generous absolute floor
+  rather than a baseline diff: shared runners vary 2–3× between jobs, so a
+  percentage gate fails constantly and gets ignored. It also asserts that cost
+  grows **linearly** with corpus size, which is the check that actually catches
+  a quadratic rule.
+
+### Fixed
+
+- **Notebook imports did not cross cell boundaries.** `merge_imports` copied
+  the seven boolean domain flags but not the `aliases` / `from_imports` maps,
+  so `call_module` returned `None` in every cell except the one holding the
+  `import`. Since v1.1 made alias resolution mandatory for many rules, **every
+  rule that resolves a call through an import alias was silently dead in
+  notebooks** — identical code reported `XR007` and `NP003` as a `.py` file and
+  nothing as a `.ipynb`. The v1.2 `scipy` and `gpu` flags were missing too, so
+  the SciPy rules could never fire in a notebook at all.
+
+  Replaced with `ImportContext::merge_from`, which destructures the source
+  context exhaustively: adding a field to `ImportContext` now fails to compile
+  here instead of silently not being merged. Covered by a new
+  `tests/fixtures/notebook_bad.ipynb` — the first notebook fixture in the
+  suite.
+
+### Changed — memory
+
+Peak RSS on a **1 M-line** corpus, against the roadmap's < 200 MB target:
+
+| Corpus | Before | After |
+|--------|--------|-------|
+| Healthy code (0 findings) | — | **31–41 MB** |
+| Violation-dense, 175 k findings, `--format json` | 576 MB | **153 MB** |
+| Violation-dense, `--format text` | 305 MB | **174 MB** |
+| Violation-dense, with cache | 781 MB | 388 MB |
+
+Three fixes got there:
+
+- **JSON output no longer builds a `serde_json::Value` tree.** The `json!`
+  macro cloned every diagnostic and every field into a boxed, string-keyed
+  tree before rendering, then rendered that into a second full-size `String`.
+  Now serialised directly from borrowed diagnostics to stdout. Field *order*
+  in the output changed (declaration order rather than alphabetical); the
+  content is byte-for-byte equivalent once parsed, and `schema_version` is
+  unchanged.
+- **The cache no longer clones diagnostics it will not store.** With
+  `--no-cache` the copy taken for the cache was pure waste.
+- **The cache writes straight to the file** rather than building the whole
+  document as a `String` first, and carries hits over by path instead of
+  copying their findings.
+
+The remaining over-target case is a 1 M-line corpus with 175 k findings *and*
+the cache enabled — a codebase with a finding every six lines, which is not a
+corpus anyone lints twice.
+
+---
+
+## [1.2.1] — unreleased
+
 ### Changed
 
 - **Published to crates.io as `xray-cs`.** The name `xray` was already taken by

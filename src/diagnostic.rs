@@ -1,10 +1,10 @@
 use crate::fix::Fix;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Rule identifier, e.g. "XR001"
 pub type RuleId = &'static str;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Hint,
@@ -49,7 +49,11 @@ pub struct Diagnostic {
     /// rewrite is verifiable syntactically — see `src/fix.rs`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<Fix>,
-    pub url: Option<&'static str>,
+    /// Docs link for this finding. Owned rather than `&'static str` so a
+    /// diagnostic can round-trip through the on-disk cache: 12 rules emit a
+    /// URL that differs from their `explain` entry, so it cannot be re-derived
+    /// from the rule ID on load.
+    pub url: Option<String>,
     /// For Jupyter notebook cells the file path is a display label like
     /// `notebook.ipynb:cell[3]` that cannot be read from disk.  When set,
     /// the renderer uses this source text instead of reading `file`.
@@ -98,8 +102,8 @@ impl Diagnostic {
         self
     }
 
-    pub fn with_url(mut self, url: &'static str) -> Self {
-        self.url = Some(url);
+    pub fn with_url(mut self, url: impl Into<String>) -> Self {
+        self.url = Some(url.into());
         self
     }
 

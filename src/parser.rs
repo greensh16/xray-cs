@@ -76,6 +76,58 @@ impl ImportContext {
             .min()
     }
 
+    /// Fold another context's imports into this one.
+    ///
+    /// Used by the notebook reader, where each cell is parsed separately but
+    /// the *notebook* is one namespace: `import xarray as xr` in cell 1 has to
+    /// gate — and resolve aliases for — cell 5.
+    ///
+    /// `other` is destructured exhaustively on purpose. Adding a field to
+    /// `ImportContext` must fail to compile here rather than silently not be
+    /// merged: that is exactly how `scipy`, `gpu`, `aliases` and
+    /// `from_imports` came to be missing, which left every alias-resolving
+    /// rule dead in notebooks while the same code in a `.py` file reported
+    /// normally.
+    ///
+    /// Bindings are first-wins, and cells are merged in order, so the result
+    /// does not depend on the order cells happened to finish parsing.
+    pub fn merge_from(&mut self, other: &Self) {
+        let Self {
+            xarray,
+            dask,
+            numpy,
+            pandas,
+            netcdf4,
+            zarr,
+            h5py,
+            scipy,
+            gpu,
+            aliases,
+            from_imports,
+        } = other;
+
+        self.xarray |= xarray;
+        self.dask |= dask;
+        self.numpy |= numpy;
+        self.pandas |= pandas;
+        self.netcdf4 |= netcdf4;
+        self.zarr |= zarr;
+        self.h5py |= h5py;
+        self.scipy |= scipy;
+        self.gpu |= gpu;
+
+        for (binding, module) in aliases {
+            self.aliases
+                .entry(binding.clone())
+                .or_insert_with(|| module.clone());
+        }
+        for (name, module) in from_imports {
+            self.from_imports
+                .entry(name.clone())
+                .or_insert_with(|| module.clone());
+        }
+    }
+
     /// Scan the top-level import statements using AST node traversal to build
     /// the context. This avoids false positives from string literals or
     /// comments that happen to contain library names.
@@ -624,6 +676,51 @@ mod tests {
         // The comment is a real comment node, just not at the start of a line.
         let s = suppressions("x = compute()  # xray: disable=DK001\n");
         assert!(s.is_suppressed("DK001", 1));
+    }
+
+    #[test]
+    fn merge_from_carries_flags_and_alias_maps() {
+        // Notebook cell 1: the imports.
+        let a = parse_source(
+            "import xarray as xr\nimport scipy.integrate as integrate\nfrom dask import array\n"
+                .to_string(),
+        )
+        .unwrap()
+        .imports;
+        // Notebook cell 5: no imports of its own.
+        let mut b = parse_source("out = xr.concat(parts, dim='time')\n".to_string())
+            .unwrap()
+            .imports;
+        assert!(!b.xarray, "precondition: cell 5 imports nothing itself");
+
+        b.merge_from(&a);
+
+        // Domain gates, including the ones added after this merge was first
+        // written — the bug that made SP rules unreachable in notebooks.
+        assert!(b.xarray);
+        assert!(b.scipy);
+        assert!(b.dask);
+        // Alias maps, without which `call_module` answers None and every
+        // library-gated rule goes quiet.
+        assert_eq!(b.module_of_binding("xr"), Some("xarray"));
+        assert_eq!(b.module_of_binding("integrate"), Some("scipy"));
+        assert_eq!(b.module_of_name("array"), Some("dask"));
+    }
+
+    #[test]
+    fn merge_from_is_first_binding_wins() {
+        let mut first = parse_source("import numpy as np\n".to_string())
+            .unwrap()
+            .imports;
+        let second = parse_source("import nonsense as np\n".to_string())
+            .unwrap()
+            .imports;
+        first.merge_from(&second);
+        assert_eq!(
+            first.module_of_binding("np"),
+            Some("numpy"),
+            "an earlier cell's binding must win, so the merge is order-stable"
+        );
     }
 
     #[test]

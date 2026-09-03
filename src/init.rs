@@ -109,5 +109,6 @@ pub fn init(force: bool) -> Result<(), String> {
     println!("xray: wrote xray.toml");
     println!("  Edit it to customise rules, then run `xray` to lint your project.");
     println!("  Tip: create a .xrayignore file to exclude files or directories.");
+    println!("  Tip: add .xray-cache to .gitignore — xray writes its results cache there.");
     Ok(())
 }

@@ -238,7 +238,7 @@ fn xray_diags_to_lsp(diags: Vec<crate::diagnostic::Diagnostic>) -> Vec<Value> {
             });
 
             // Attach the docs URL as a related information link if present
-            if let Some(url) = d.url {
+            if let Some(url) = &d.url {
                 lsp_diag["codeDescription"] = json!({ "href": url });
             }
 

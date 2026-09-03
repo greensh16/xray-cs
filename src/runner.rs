@@ -2,10 +2,13 @@ use anyhow::Result;
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use glob::MatchOptions;
 use rayon::prelude::*;
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::io::Write;
 
 use crate::{
+    cache::Cache,
     cli::{Cli, MinSeverity, OutputFormat},
     config::Config,
     diagnostic::{Diagnostic, FileResults, RunResults, Severity},
@@ -51,23 +54,57 @@ pub fn run(cli: &Cli, config: &Config) -> Result<RunResults> {
         );
     }
 
+    // ── Results cache ─────────────────────────────────────────────────────────
+    // Loaded once and shared immutably across workers; each worker returns the
+    // raw rule output for its file and the write-back happens serially below,
+    // so no lock is needed on the hot path.
+    let mut cache = if cli.no_cache {
+        None
+    } else {
+        Some(Cache::load(
+            std::path::Path::new("."),
+            config,
+            job_script.as_ref(),
+        ))
+    };
+
     // ── Lint files in parallel ────────────────────────────────────────────────
     // Each worker reports whether its file imported a GPU library alongside its
     // diagnostics: JOB004 is a question about the whole run, not about any one
     // file, so it cannot be answered inside the per-file pass.
-    let linted: Vec<(FileResults, bool)> = paths
+    let linted: Vec<LintOutcome> = paths
         .par_iter()
         .filter_map(|path| {
             if path.ends_with(".ipynb") {
                 lint_notebook(path, config, cli, job_script.as_ref())
             } else {
-                lint_python(path, config, cli, job_script.as_ref())
+                lint_python(path, config, cli, job_script.as_ref(), cache.as_ref())
             }
         })
         .collect();
 
-    let any_gpu_import = linted.iter().any(|(_, gpu)| *gpu);
-    let mut file_results: Vec<FileResults> = linted.into_iter().map(|(f, _)| f).collect();
+    let any_gpu_import = linted.iter().any(|o| o.imports_gpu);
+
+    // Write back every file this run saw, so entries for deleted files are
+    // pruned rather than accumulating.
+    if let Some(ref mut c) = cache {
+        for outcome in &linted {
+            match outcome.cacheable {
+                // Re-checked: store the fresh findings.
+                Some(ref raw) => {
+                    c.insert(&outcome.results.path, raw);
+                    c.record_miss();
+                }
+                // Hit, or a notebook (never cached). `record_hit` carries the
+                // existing entry over by path, without copying its findings.
+                None if outcome.from_cache => c.record_hit(&outcome.results.path),
+                None => {}
+            }
+        }
+        c.save();
+    }
+
+    let mut file_results: Vec<FileResults> = linted.into_iter().map(|o| o.results).collect();
 
     // ── JOB004: one finding per run, reported against the job script ──────────
     if let Some(ref job) = job_script
@@ -140,25 +177,69 @@ pub fn resolve_paths(cli: &Cli, config: &Config, explicit: &[String]) -> Result<
 
 // ── per-file lint helpers ─────────────────────────────────────────────────────
 
+/// What one file contributed to the run.
+struct LintOutcome {
+    results: FileResults,
+    /// Did this file import a GPU library? Answered per file, consumed once
+    /// for the whole run by JOB004.
+    imports_gpu: bool,
+    /// Raw rule output, before CLI filtering, for the cache to store. `None`
+    /// for notebooks, which are not cached.
+    cacheable: Option<Vec<Diagnostic>>,
+    from_cache: bool,
+}
+
 /// Lint a single `.py` (or other Python) file.
+///
+/// On a cache hit the file is neither read nor parsed: the stored diagnostics
+/// are the raw rule output, and only the per-invocation CLI filters are
+/// re-applied on top.
 fn lint_python(
     path: &str,
     config: &Config,
     cli: &Cli,
     job: Option<&JobScript>,
-) -> Option<(FileResults, bool)> {
+    cache: Option<&Cache>,
+) -> Option<LintOutcome> {
+    if let Some(raw) = cache.and_then(|c| c.get(path)) {
+        let mut diags = raw;
+        apply_filters(&mut diags, config, cli);
+        return Some(LintOutcome {
+            results: FileResults {
+                path: path.to_string(),
+                diagnostics: diags,
+            },
+            // A cached file contributed no import context, so it cannot vote
+            // on JOB004. That is sound: JOB004 only fires when *nothing* in
+            // the run imports a GPU library, and a job script is part of the
+            // cache fingerprint — so any run where JOB004 could fire has a
+            // fingerprint of its own.
+            imports_gpu: false,
+            // Nothing to store: the entry already on disk is still correct,
+            // and `record_hit` carries it over by path.
+            cacheable: None,
+            from_cache: true,
+        });
+    }
+
     match parser::parse_file(path) {
         Ok(parsed) => {
             let mut diags = rules::run_all_with_job(&parsed, path, config, job);
+            // The cache stores the *unfiltered* rule output, so it needs a copy
+            // taken before `apply_filters`. Only pay for it when there is a
+            // cache to store it in — with `--no-cache` this clone was pure
+            // waste, and on a large corpus it was tens of megabytes of it.
+            let cacheable = cache.is_some().then(|| diags.clone());
             apply_filters(&mut diags, config, cli);
-            let imports_gpu = parsed.imports.gpu;
-            Some((
-                FileResults {
+            Some(LintOutcome {
+                results: FileResults {
                     path: path.to_string(),
                     diagnostics: diags,
                 },
-                imports_gpu,
-            ))
+                imports_gpu: parsed.imports.gpu,
+                cacheable,
+                from_cache: false,
+            })
         }
         Err(e) => {
             eprintln!("xray: could not parse {path}: {e}");
@@ -179,7 +260,7 @@ fn lint_notebook(
     config: &Config,
     cli: &Cli,
     job: Option<&JobScript>,
-) -> Option<(FileResults, bool)> {
+) -> Option<LintOutcome> {
     let cells = match notebook::parse_notebook(path) {
         Ok(c) => c,
         Err(e) => {
@@ -209,13 +290,18 @@ fn lint_notebook(
         all_diags.extend(diags);
     }
 
-    Some((
-        FileResults {
+    Some(LintOutcome {
+        results: FileResults {
             path: path.to_string(),
             diagnostics: all_diags,
         },
         imports_gpu,
-    ))
+        // Notebook diagnostics carry a `source_override` holding the cell's
+        // text for the renderer; caching them would mean storing every cell's
+        // source too. See the note in `src/cache.rs`.
+        cacheable: None,
+        from_cache: false,
+    })
 }
 
 /// Apply config severity overrides, CLI disable list, and min-severity filter
@@ -318,12 +404,12 @@ fn render_text(results: &RunResults, _paths: &[String]) {
             report = report.with_help(suggestion.clone());
         }
         if let Some(ref fix) = diag.fix_hint {
-            let note = match diag.url {
+            let note = match &diag.url {
                 Some(url) => format!("fix: {fix}  |  docs: {url}"),
                 None => format!("fix: {fix}"),
             };
             report = report.with_note(note);
-        } else if let Some(url) = diag.url {
+        } else if let Some(url) = &diag.url {
             report = report.with_note(format!("docs: {url}"));
         }
 
@@ -348,7 +434,15 @@ fn render_text(results: &RunResults, _paths: &[String]) {
 // ── format: json ──────────────────────────────────────────────────────────────
 
 fn render_json(results: &RunResults) -> Result<()> {
-    println!("{}", build_json(results)?);
+    // Serialised straight to stdout rather than through `build_json`'s String:
+    // on a large corpus the rendered document is itself tens of megabytes, and
+    // holding it alongside the diagnostics it was built from doubled peak RSS
+    // for no benefit.
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    serde_json::to_writer_pretty(&mut out, &JsonReport::new(results))?;
+    out.write_all(b"\n")?;
+    out.flush()?;
     Ok(())
 }
 
@@ -363,30 +457,55 @@ fn render_json(results: &RunResults) -> Result<()> {
 /// }
 /// ```
 pub fn build_json(results: &RunResults) -> Result<String> {
-    let diags: Vec<_> = results.all_diagnostics().collect();
-    let errors = diags
-        .iter()
-        .filter(|d| d.severity == Severity::Error)
-        .count();
-    let warnings = diags
-        .iter()
-        .filter(|d| d.severity == Severity::Warning)
-        .count();
-    let hints = diags
-        .iter()
-        .filter(|d| d.severity == Severity::Hint)
-        .count();
-    let envelope = json!({
-        "schema_version": JSON_SCHEMA_VERSION,
-        "diagnostics": diags,
-        "summary": {
-            "total": diags.len(),
-            "errors": errors,
-            "warnings": warnings,
-            "hints": hints,
+    Ok(serde_json::to_string_pretty(&JsonReport::new(results))?)
+}
+
+/// The JSON output envelope, serialised by borrowing the diagnostics rather
+/// than cloning them into a `serde_json::Value` tree.
+///
+/// The `json!` macro used to build a `Value` for every diagnostic and every
+/// field within it before rendering. `Value` is a boxed, string-keyed tree, so
+/// that intermediate cost several times what the diagnostics themselves
+/// occupy — on a 1 M-line corpus it was the single largest allocation in the
+/// process. Deriving `Serialize` over borrowed data emits the same bytes with
+/// no intermediate representation at all.
+#[derive(Serialize)]
+struct JsonReport<'a> {
+    schema_version: &'static str,
+    diagnostics: Vec<&'a Diagnostic>,
+    summary: JsonSummary,
+}
+
+#[derive(Serialize)]
+struct JsonSummary {
+    total: usize,
+    errors: usize,
+    warnings: usize,
+    hints: usize,
+}
+
+impl<'a> JsonReport<'a> {
+    fn new(results: &'a RunResults) -> Self {
+        let diagnostics: Vec<&'a Diagnostic> = results.all_diagnostics().collect();
+        let mut summary = JsonSummary {
+            total: diagnostics.len(),
+            errors: 0,
+            warnings: 0,
+            hints: 0,
+        };
+        for d in &diagnostics {
+            match d.severity {
+                Severity::Error => summary.errors += 1,
+                Severity::Warning => summary.warnings += 1,
+                Severity::Hint => summary.hints += 1,
+            }
         }
-    });
-    Ok(serde_json::to_string_pretty(&envelope)?)
+        Self {
+            schema_version: JSON_SCHEMA_VERSION,
+            diagnostics,
+            summary,
+        }
+    }
 }
 
 // ── format: sarif ─────────────────────────────────────────────────────────────
@@ -490,7 +609,7 @@ fn build_sarif_result(d: &Diagnostic) -> Value {
     }
 
     // Attach docs URL as a related location / help URI
-    if let Some(url) = d.url {
+    if let Some(url) = &d.url {
         result["helpUri"] = json!(url);
     }
 

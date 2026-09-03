@@ -12,7 +12,7 @@
 //! See `fix_eligible` in `src/explain.rs`.
 
 use crate::diagnostic::Diagnostic;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Rules `xray fix` can actually apply.
 ///
@@ -41,7 +41,7 @@ pub fn is_fixable(rule_id: &str) -> bool {
 /// Byte offsets are into the **CRLF-normalised** source that the parser saw,
 /// which is what [`apply`] expects. Line/column are carried alongside for SARIF,
 /// whose `replacements` are expressed as regions rather than offsets.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Fix {
     /// Short human description, e.g. `add chunks="auto"`.
     pub description: String,

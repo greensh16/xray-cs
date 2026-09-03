@@ -82,3 +82,22 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  # ── Performance guard ────────────────────────────────────────────────────────
+  # A generous absolute floor, not a baseline diff: shared runners vary by 2-3x
+  # between jobs, so a percentage gate would fail constantly and be ignored.
+  # This catches the regression that actually ships — a rule that is quadratic
+  # in file size — which is orders of magnitude, not percent.
+  perf:
+    name: Performance guard
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run performance guard (release)
+        run: cargo test --release --test perf_guard -- --ignored --nocapture

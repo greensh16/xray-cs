@@ -215,6 +215,17 @@ const CROSS_DOMAIN_META: &[RuleMeta] = &[RuleMeta {
     description: "A `# xray: disable=` comment that suppressed nothing — the rule no longer fires here",
 }];
 
+/// The `&'static str` this build uses for `rule_id`, given its text.
+///
+/// The cache stores rule IDs as owned strings; this maps them back, and
+/// returns `None` for an ID this build does not have — which is how a cache
+/// written by a different version is rejected rather than half-understood.
+pub fn static_rule_id(id: &str) -> Option<&'static str> {
+    static IDS: std::sync::LazyLock<Vec<&'static str>> =
+        std::sync::LazyLock::new(|| all_meta().iter().map(|m| m.id).collect());
+    IDS.iter().copied().find(|known| *known == id)
+}
+
 /// All rule metadata for --list-rules
 pub fn all_meta() -> Vec<RuleMeta> {
     let mut meta = Vec::new();
