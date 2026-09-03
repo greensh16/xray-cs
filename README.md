@@ -1,6 +1,16 @@
 # xray
 
+[![CI](https://github.com/greensh16/xray-cs/actions/workflows/ci.yml/badge.svg)](https://github.com/greensh16/xray-cs/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/greensh16/xray-cs?sort=semver)](https://github.com/greensh16/xray-cs/releases/latest)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![docs](https://img.shields.io/badge/docs-wiki-blue)](https://github.com/greensh16/xray-cs/wiki)
+
+<!-- Add these two once `xray-cs` is published to crates.io — until then they
+     render "crates.io: not found":
 [![crates.io](https://img.shields.io/crates/v/xray-cs.svg)](https://crates.io/crates/xray-cs)
+[![downloads](https://img.shields.io/crates/d/xray-cs.svg)](https://crates.io/crates/xray-cs)
+-->
+
 
 A fast, self-contained Rust linter for scientific Python workflows on HPC systems.
 Targets **xarray**, **dask**, **NumPy**, **pandas**, **SciPy** and **scientific I/O**
@@ -142,4 +152,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the rule-authoring workflow, includin
 tree-sitter query authoring. To request a rule, use the
 [rule request template](.github/ISSUE_TEMPLATE/rule-request.md).
 
-Licensed under MIT or Apache-2.0, at your option.
+## License
+
+Licensed under either **MIT** or **Apache-2.0**, at your option.
