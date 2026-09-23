@@ -92,7 +92,7 @@ pub fn run(cli: &Cli, config: &Config) -> Result<RunResults> {
             match outcome.cacheable {
                 // Re-checked: store the fresh findings.
                 Some(ref raw) => {
-                    c.insert(&outcome.results.path, raw);
+                    c.insert(&outcome.results.path, raw, outcome.imports_gpu);
                     c.record_miss();
                 }
                 // Hit, or a notebook (never cached). `record_hit` carries the
@@ -201,20 +201,17 @@ fn lint_python(
     job: Option<&JobScript>,
     cache: Option<&Cache>,
 ) -> Option<LintOutcome> {
-    if let Some(raw) = cache.and_then(|c| c.get(path)) {
-        let mut diags = raw;
+    if let Some(hit) = cache.and_then(|c| c.get(path)) {
+        let mut diags = hit.diagnostics;
         apply_filters(&mut diags, config, cli);
         return Some(LintOutcome {
             results: FileResults {
                 path: path.to_string(),
                 diagnostics: diags,
             },
-            // A cached file contributed no import context, so it cannot vote
-            // on JOB004. That is sound: JOB004 only fires when *nothing* in
-            // the run imports a GPU library, and a job script is part of the
-            // cache fingerprint — so any run where JOB004 could fire has a
-            // fingerprint of its own.
-            imports_gpu: false,
+            // Import facts are cached alongside diagnostics because JOB004 is
+            // evaluated once across the whole run, including warm-cache files.
+            imports_gpu: hit.imports_gpu,
             // Nothing to store: the entry already on disk is still correct,
             // and `record_hit` carries it over by path.
             cacheable: None,

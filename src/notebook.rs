@@ -12,7 +12,10 @@ use anyhow::Result;
 use rayon::prelude::*;
 use serde_json::Value;
 
-use crate::parser::{self, ImportContext, ParsedFile};
+use crate::{
+    bindings::Bindings,
+    parser::{self, ImportContext, ParsedFile},
+};
 
 /// A single code cell extracted from a Jupyter notebook, ready for linting.
 pub struct NotebookCell {
@@ -93,7 +96,17 @@ pub fn parse_notebook(path: &str) -> Result<Vec<NotebookCell>> {
             merged.merge_from(&cell.parsed.imports);
         }
         for cell in &mut notebook_cells {
-            cell.parsed.imports = merged.clone();
+            let imports = merged.clone();
+            // Bindings classify assignment origins using the import table.
+            // They were initially built while parsing this cell in isolation,
+            // so rebuild them now that aliases from the other cells are known.
+            let bindings = Bindings::build(
+                cell.parsed.tree.root_node(),
+                cell.parsed.source.as_bytes(),
+                &imports,
+            );
+            cell.parsed.imports = imports;
+            cell.parsed.bindings = bindings;
         }
     }
 

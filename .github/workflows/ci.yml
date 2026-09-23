@@ -59,6 +59,10 @@ jobs:
 
       - name: Run tests (cross-compiled)
         if: matrix.cross
+        env:
+          # Process scenarios spawn the target binary directly; cross executes
+          # test binaries through QEMU but cannot do that for their children.
+          XRAY_SKIP_PROCESS_SCENARIOS: 1
         run: cross test --target ${{ matrix.target }} --all-features
 
   # ── Lint / format gate ───────────────────────────────────────────────────────

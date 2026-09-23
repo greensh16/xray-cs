@@ -34,7 +34,7 @@ Or download a pre-built binary from the [releases page](https://github.com/green
 no Rust toolchain needed, which is usually what you want on a login node:
 
 ```bash
-curl -L https://github.com/greensh16/xray-cs/releases/download/v1.2.0/xray-linux-x86_64 \
+curl -L https://github.com/greensh16/xray-cs/releases/download/v1.3.0/xray-linux-x86_64 \
   -o ~/.local/bin/xray && chmod +x ~/.local/bin/xray
 ```
 
@@ -53,6 +53,7 @@ xray --job run.sh analysis.py # also cross-check the Slurm/PBS resource request
 xray fix src/                 # apply the mechanical fixes, printing a diff
 xray --diff HEAD~1            # only files changed since the last commit
 xray --watch                  # re-lint on save
+XRAY_WATCH_POLL=1 xray --watch  # polling fallback for NFS/Lustre
 xray -j 4                     # cap worker threads (do this on a login node)
 xray --no-cache               # ignore .xray-cache for this run
 xray explain XR012            # rationale and a bad/good example for one rule

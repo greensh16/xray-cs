@@ -16,7 +16,8 @@
 
 use anyhow::Result;
 use notify::{
-    Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    Config as NotifyConfig, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode,
+    Watcher,
 };
 use std::{
     collections::HashSet,
@@ -38,21 +39,47 @@ pub fn run_watch(cli: &Cli, config: &Config) -> Result<()> {
 
     // ── Set up file watcher ───────────────────────────────────────────────────
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
-    let mut watcher = RecommendedWatcher::new(tx, NotifyConfig::default())?;
+    // Native event streams are best on local filesystems. Polling is an
+    // explicit escape hatch for NFS/Lustre and restricted macOS environments
+    // where registration succeeds but the OS delivers no events.
+    let mut watcher: Box<dyn Watcher> = if std::env::var_os("XRAY_WATCH_POLL").is_some() {
+        Box::new(PollWatcher::new(
+            tx.clone(),
+            NotifyConfig::default()
+                .with_poll_interval(Duration::from_millis(100))
+                .with_compare_contents(true),
+        )?)
+    } else {
+        Box::new(RecommendedWatcher::new(tx, NotifyConfig::default())?)
+    };
 
     // Determine which paths to watch.  If the user supplied explicit file
     // paths, watch their parent directories; otherwise watch the roots.
     let watch_roots = watch_roots(cli);
+    let mut registered = 0usize;
     for root in &watch_roots {
-        let mode = if Path::new(root).is_file() {
+        // FSEvents can accept a relative path without returning an error but
+        // then fail to deliver events for it. Register canonical roots on all
+        // platforms so backend behavior is consistent.
+        let watch_path = std::fs::canonicalize(root).unwrap_or_else(|_| PathBuf::from(root));
+        let mode = if watch_path.is_file() {
             RecursiveMode::NonRecursive
         } else {
             RecursiveMode::Recursive
         };
-        if let Err(e) = watcher.watch(Path::new(root), mode) {
+        if let Err(e) = watcher.watch(&watch_path, mode) {
             eprintln!("xray: cannot watch {root}: {e}");
+        } else {
+            registered += 1;
         }
     }
+    if registered == 0 {
+        anyhow::bail!("could not register any watch roots");
+    }
+    eprintln!(
+        "xray: watching {registered} root{}",
+        if registered == 1 { "" } else { "s" }
+    );
 
     let ignore = IgnorePatterns::load(".");
 

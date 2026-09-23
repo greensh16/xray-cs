@@ -2410,6 +2410,15 @@ fn notebook_imports_cross_cell_boundaries() {
 }
 
 #[test]
+fn notebook_cross_cell_imports_rebuild_receiver_bindings() {
+    let found = check_notebook_fixture("notebook_bindings.ipynb");
+    assert!(
+        found.contains(&(2, "PD002")),
+        "PD002 needs the DataFrame assignment to resolve through the pandas import in cell 1; got {found:?}"
+    );
+}
+
+#[test]
 fn notebook_skips_markdown_and_preserves_line_numbers() {
     let path = "tests/fixtures/notebook_bad.ipynb";
     let cells = xray::notebook::parse_notebook(path).unwrap();

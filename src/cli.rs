@@ -100,6 +100,9 @@ pub struct Cli {
     /// Examples:
     ///   xray --watch
     ///   xray --watch src/
+    ///
+    /// Set XRAY_WATCH_POLL=1 on NFS/Lustre or when native filesystem events
+    /// are unavailable. Polling checks for changes every 100 ms.
     #[arg(long)]
     pub watch: bool,
 

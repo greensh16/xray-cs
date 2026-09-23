@@ -9,9 +9,10 @@
 //! exactly once already, so there is nothing to reuse.
 //!
 //! The user-visible goal is the same either way: do no work for a file that
-//! has not changed. So the cache stores each file's **diagnostics** and skips
-//! both the parse *and* the rule pass on a hit, which is strictly more saved
-//! work than reusing a tree would have been.
+//! has not changed. So the cache stores each file's **diagnostics** plus the
+//! small import facts needed by run-wide rules, and skips both the parse and
+//! the rule pass on a hit. That is strictly more saved work than reusing a tree
+//! would have been.
 //!
 //! ## Correctness
 //!
@@ -58,7 +59,7 @@ pub const CACHE_FILE: &str = ".xray-cache";
 
 /// Bumped when the on-disk shape changes incompatibly. An older or newer
 /// version is treated as a miss, not an error.
-const CACHE_FORMAT_VERSION: u32 = 1;
+const CACHE_FORMAT_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
@@ -72,7 +73,16 @@ struct CacheFile {
 struct CacheEntry {
     mtime_ns: u128,
     size: u64,
+    /// Run-wide rules such as JOB004 need import facts even when this file's
+    /// diagnostics come from the cache.
+    imports_gpu: bool,
     diagnostics: Vec<CachedDiagnostic>,
+}
+
+/// Everything a cache hit contributes to the current run.
+pub struct CacheHit {
+    pub diagnostics: Vec<Diagnostic>,
+    pub imports_gpu: bool,
 }
 
 /// A [`Diagnostic`] in a form that survives a round-trip to disk.
@@ -174,7 +184,7 @@ impl Cache {
 
     /// Cached diagnostics for `path`, if the file is unchanged since they were
     /// recorded.
-    pub fn get(&self, path: &str) -> Option<Vec<Diagnostic>> {
+    pub fn get(&self, path: &str) -> Option<CacheHit> {
         let entry = self.loaded.get(path)?;
         let (mtime_ns, size) = file_stamp(path)?;
         if entry.mtime_ns != mtime_ns || entry.size != size {
@@ -182,12 +192,16 @@ impl Cache {
         }
         // A single unknown rule ID invalidates the entry rather than silently
         // dropping that finding.
-        entry
+        let diagnostics = entry
             .diagnostics
             .iter()
             .cloned()
             .map(|d| d.into_diagnostic(path))
-            .collect()
+            .collect::<Option<Vec<_>>>()?;
+        Some(CacheHit {
+            diagnostics,
+            imports_gpu: entry.imports_gpu,
+        })
     }
 
     /// Record this run's diagnostics for `path`.
@@ -195,7 +209,7 @@ impl Cache {
     /// `diagnostics` must be the raw rule output, before any CLI filtering:
     /// `--disable` and `--min-severity` change per invocation and are applied
     /// to whatever the cache returns.
-    pub fn insert(&mut self, path: &str, diagnostics: &[Diagnostic]) {
+    pub fn insert(&mut self, path: &str, diagnostics: &[Diagnostic], imports_gpu: bool) {
         let Some((mtime_ns, size)) = file_stamp(path) else {
             return;
         };
@@ -204,6 +218,7 @@ impl Cache {
             CacheEntry {
                 mtime_ns,
                 size,
+                imports_gpu,
                 diagnostics: diagnostics
                     .iter()
                     .map(CachedDiagnostic::from_diagnostic)
@@ -379,21 +394,28 @@ mod tests {
 
         let mut c = Cache::load(&dir, &cfg, None);
         assert!(c.get(&path).is_none(), "empty cache cannot hit");
-        c.insert(&path, &[diag("NP003", 1), diag("XR001", 2)]);
+        c.insert(&path, &[diag("NP003", 1), diag("XR001", 2)], true);
         c.save();
 
         let c2 = Cache::load(&dir, &cfg, None);
         let hit = c2.get(&path).expect("unchanged file should hit");
-        assert_eq!(hit.len(), 2);
-        assert_eq!(hit[0].rule_id, "NP003");
+        assert!(hit.imports_gpu);
+        assert_eq!(hit.diagnostics.len(), 2);
+        assert_eq!(hit.diagnostics[0].rule_id, "NP003");
         // The `&'static str` rule id is resolved back through the registry.
         assert!(std::ptr::eq(
-            hit[0].rule_id,
+            hit.diagnostics[0].rule_id,
             rules::static_rule_id("NP003").unwrap()
         ));
         // A URL that cannot be re-derived from the rule ID survives verbatim.
-        assert_eq!(hit[0].url.as_deref(), Some("https://example.invalid/rule"));
-        assert_eq!(hit[0].suggestion.as_deref(), Some("do it differently"));
+        assert_eq!(
+            hit.diagnostics[0].url.as_deref(),
+            Some("https://example.invalid/rule")
+        );
+        assert_eq!(
+            hit.diagnostics[0].suggestion.as_deref(),
+            Some("do it differently")
+        );
     }
 
     #[test]
@@ -405,7 +427,7 @@ mod tests {
         let cfg = Config::default();
 
         let mut c = Cache::load(&dir, &cfg, None);
-        c.insert(&path, &[diag("NP003", 1)]);
+        c.insert(&path, &[diag("NP003", 1)], false);
         c.save();
 
         // Different size — the cheapest of the two stamps to change reliably.
@@ -421,7 +443,7 @@ mod tests {
         let path = file.to_string_lossy().to_string();
 
         let mut c = Cache::load(&dir, &Config::default(), None);
-        c.insert(&path, &[diag("NP003", 1)]);
+        c.insert(&path, &[diag("NP003", 1)], false);
         c.save();
 
         // Disabling a rule changes what the rules produce, so every entry
@@ -446,7 +468,7 @@ mod tests {
 
         let job_a = crate::job::parse_job_source("#SBATCH --cpus-per-task=4\n", "run.sh");
         let mut c = Cache::load(&dir, &cfg, Some(&job_a));
-        c.insert(&path, &[diag("NP003", 1)]);
+        c.insert(&path, &[diag("NP003", 1)], false);
         c.save();
 
         assert!(Cache::load(&dir, &cfg, Some(&job_a)).get(&path).is_some());
@@ -455,6 +477,26 @@ mod tests {
         assert!(Cache::load(&dir, &cfg, Some(&job_b)).get(&path).is_none());
         // No job at all is a different key again.
         assert!(Cache::load(&dir, &cfg, None).get(&path).is_none());
+    }
+
+    #[test]
+    fn cached_gpu_import_still_suppresses_run_level_job004() {
+        let dir = tmpdir("gpu-import");
+        let file = dir.join("gpu.py");
+        std::fs::write(&file, "import cupy as cp\n").unwrap();
+        let path = file.to_string_lossy().to_string();
+        let cfg = Config::default();
+        let job = crate::job::parse_job_source("#SBATCH --gres=gpu:1\n", "run.sh");
+
+        let mut cache = Cache::load(&dir, &cfg, Some(&job));
+        cache.insert(&path, &[], true);
+        cache.save();
+
+        let hit = Cache::load(&dir, &cfg, Some(&job))
+            .get(&path)
+            .expect("unchanged GPU file should hit");
+        assert!(hit.imports_gpu);
+        assert!(crate::rules::job::job004(hit.imports_gpu, &job, &cfg).is_none());
     }
 
     #[test]
@@ -471,7 +513,7 @@ mod tests {
         // A rule this build does not know invalidates the entry rather than
         // silently dropping the finding.
         let mut c = Cache::load(&dir, &cfg, None);
-        c.insert(&path, &[]);
+        c.insert(&path, &[], false);
         c.save();
         let raw = std::fs::read_to_string(dir.join(CACHE_FILE)).unwrap();
         let doctored = raw.replace("\"diagnostics\":[]", "\"diagnostics\":[{\"rule_id\":\"ZZ999\",\"severity\":\"warning\",\"line\":1,\"column\":1,\"message\":\"m\",\"suggestion\":null,\"fix_hint\":null,\"fix\":null,\"url\":null}]");
@@ -493,14 +535,14 @@ mod tests {
         let cfg = Config::default();
 
         let mut c = Cache::load(&dir, &cfg, None);
-        c.insert(&pa, &[diag("NP003", 1)]);
-        c.insert(&pb, &[diag("NP003", 1)]);
+        c.insert(&pa, &[diag("NP003", 1)], false);
+        c.insert(&pb, &[diag("NP003", 1)], false);
         c.save();
 
         // A later run that only sees a.py writes back only a.py.
         let mut c2 = Cache::load(&dir, &cfg, None);
         assert!(c2.get(&pb).is_some(), "b.py is in the cache to begin with");
-        c2.insert(&pa, &[diag("NP003", 1)]);
+        c2.insert(&pa, &[diag("NP003", 1)], false);
         c2.save();
 
         let c3 = Cache::load(&dir, &cfg, None);

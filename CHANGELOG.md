@@ -9,7 +9,13 @@ xray uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added — v1.3 performance milestone (in progress)
+## [1.3.0] — 2026-09-23
+
+The v1.3 milestone adds persistent caching and substantial memory reductions,
+while hardening configuration inheritance, notebooks, watch mode, LSP sessions,
+and the published GitHub Action.
+
+### Added
 
 - **Persistent results cache (`.xray-cache`).** Unchanged files are neither
   re-read, re-parsed nor re-checked. Keyed on each file's `(mtime, size)` plus
@@ -48,7 +54,36 @@ xray uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   grows **linearly** with corpus size, which is the check that actually catches
   a quadratic rule.
 
+- **End-to-end scenario suite.** Process-level tests exercise cold, warm and
+  disabled caches; inherited configuration changes; cross-cell notebook
+  bindings; Unicode positions over an LSP session; real watch-mode filesystem
+  events; and the shell/glob handling used by the published GitHub Action.
+
+- **Deterministic watch polling for tests and constrained filesystems.** Set
+  `XRAY_WATCH_POLL=1` to use a content-aware polling watcher with a 100 ms
+  interval. Watch roots are canonicalised and the CLI reports when it is ready.
+
 ### Fixed
+
+- **Warm-cache GPU job checks.** Cached files now retain GPU-import metadata,
+  preventing a false JOB004 warning on a warm run. This changes the on-disk
+  cache format to v2; older caches are ignored and rebuilt automatically.
+
+- **Inherited domain configuration.** Parent and child TOML are now merged
+  before deserialisation, so explicitly configured default-valued settings and
+  partially overridden domain tables survive inheritance correctly.
+
+- **Cross-cell notebook receiver inference.** Bindings are rebuilt after
+  imports are merged across cells, so receiver-sensitive rules behave the same
+  for notebooks as they do for equivalent Python files.
+
+- **LSP positions for non-ASCII source.** Diagnostic columns are converted
+  from UTF-8 byte offsets to the UTF-16 code units required by the Language
+  Server Protocol.
+
+- **GitHub Action input handling.** The action now passes paths and flags via a
+  checked-in shell entrypoint, preserving spaces and globs while preventing
+  command substitution through action inputs.
 
 - **Notebook imports did not cross cell boundaries.** `merge_imports` copied
   the seven boolean domain flags but not the `aliases` / `from_imports` maps,
@@ -64,6 +99,25 @@ xray uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   here instead of silently not being merged. Covered by a new
   `tests/fixtures/notebook_bad.ipynb` — the first notebook fixture in the
   suite.
+
+### Changed — packaging
+
+- **Published to crates.io as `xray-cs`.** The name `xray` was already taken by
+  an unrelated 2018 crate, so the package — and only the package — is renamed:
+
+  ```bash
+  cargo install xray-cs      # installs a binary called `xray`
+  ```
+
+  Nothing user-facing changes. The command is still `xray`, the config file is
+  still `xray.toml`, suppression comments are still `# xray: disable=`, the
+  environment variables are still `XRAY_*`, the ignore file is still
+  `.xrayignore`, and the library target is still `xray` so `use xray::` keeps
+  working. Existing projects need no migration.
+
+- The GitHub repository moved to **`greensh16/xray-cs`**. Every docs URL —
+  including the wiki links embedded in diagnostics — points at the new
+  location. GitHub redirects the old URLs, so older releases keep working.
 
 ### Changed — memory
 
@@ -94,29 +148,6 @@ Three fixes got there:
 The remaining over-target case is a 1 M-line corpus with 175 k findings *and*
 the cache enabled — a codebase with a finding every six lines, which is not a
 corpus anyone lints twice.
-
----
-
-## [1.2.1] — unreleased
-
-### Changed
-
-- **Published to crates.io as `xray-cs`.** The name `xray` was already taken by
-  an unrelated 2018 crate, so the package — and only the package — is renamed:
-
-  ```bash
-  cargo install xray-cs      # installs a binary called `xray`
-  ```
-
-  Nothing user-facing changes. The command is still `xray`, the config file is
-  still `xray.toml`, suppression comments are still `# xray: disable=`, the
-  environment variables are still `XRAY_*`, the ignore file is still
-  `.xrayignore`, and the library target is still `xray` so `use xray::` keeps
-  working. Existing projects need no migration.
-
-- The GitHub repository moved to **`greensh16/xray-cs`**. Every docs URL —
-  including the wiki links embedded in diagnostics — points at the new
-  location. GitHub redirects the old URLs, so older releases keep working.
 
 ---
 
@@ -775,7 +806,9 @@ Correctness elsewhere:
 
 ---
 
-[Unreleased]: https://github.com/greensh16/xray-cs/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/greensh16/xray-cs/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/greensh16/xray-cs/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/greensh16/xray-cs/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/greensh16/xray-cs/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/greensh16/xray-cs/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/greensh16/xray-cs/compare/v0.9.0...v1.0.0

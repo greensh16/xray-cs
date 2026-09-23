@@ -47,7 +47,7 @@ inputs:
 
   xray-version:
     description: >
-      xray release tag to install (e.g. v1.1.0).
+      xray release tag to install (e.g. v1.3.0).
       Defaults to the latest published release.
     required: false
     default: 'latest'
@@ -69,9 +69,11 @@ runs:
     - name: Install xray
       id: install-xray
       shell: bash
+      env:
+        INPUT_XRAY_VERSION: ${{ inputs.xray-version }}
       run: |
         set -euo pipefail
-        VERSION="${{ inputs.xray-version }}"
+        VERSION="$INPUT_XRAY_VERSION"
 
         if [[ "$VERSION" == "latest" ]]; then
           VERSION=$(curl -sSfL \
@@ -102,42 +104,11 @@ runs:
     - name: Run xray
       id: run-xray
       shell: bash
+      env:
+        INPUT_FORMAT: ${{ inputs.format }}
+        INPUT_MIN_SEVERITY: ${{ inputs.min-severity }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_PATHS: ${{ inputs.paths }}
+        INPUT_CONFIG: ${{ inputs.config }}
       run: |
-        set -euo pipefail
-
-        FORMAT="${{ inputs.format }}"
-        MIN_SEV="${{ inputs.min-severity }}"
-        FAIL_ON="${{ inputs.fail-on }}"
-        PATHS="${{ inputs.paths }}"
-        CONFIG_ARG=""
-        if [[ -n "${{ inputs.config }}" ]]; then
-          CONFIG_ARG="--config ${{ inputs.config }}"
-        fi
-
-        SARIF_FILE="${GITHUB_WORKSPACE}/xray-results.sarif"
-
-        # Count diagnostics from the JSON envelope so `issues-found` is a real
-        # total rather than a 0/1 flag derived from the exit code.
-        COUNT_JSON=$(xray --format json --min-severity "${MIN_SEV}" --fail-on never \
-          ${CONFIG_ARG} ${PATHS} || true)
-        ISSUES=$(printf '%s' "$COUNT_JSON" | python3 -c \
-          'import json,sys; print(json.load(sys.stdin)["summary"]["total"])' 2>/dev/null || echo 0)
-        echo "issues-found=${ISSUES}" >> "$GITHUB_OUTPUT"
-
-        # xray applies the severity gate itself, so every documented value of
-        # fail-on (hint | warning | error | never) is honoured.
-        CMD=(xray --format "${FORMAT}" --min-severity "${MIN_SEV}" --fail-on "${FAIL_ON}")
-        if [[ -n "$CONFIG_ARG" ]]; then
-          CMD+=(--config "${{ inputs.config }}")
-        fi
-
-        EXIT_CODE=0
-        if [[ "$FORMAT" == "sarif" ]]; then
-          "${CMD[@]}" ${PATHS} > "$SARIF_FILE" || EXIT_CODE=$?
-          echo "sarif-file=${SARIF_FILE}" >> "$GITHUB_OUTPUT"
-        else
-          "${CMD[@]}" ${PATHS} || EXIT_CODE=$?
-        fi
-
-        # Exit code 2 is an internal error and always fails the step.
-        exit $EXIT_CODE
+        bash "$GITHUB_ACTION_PATH/scripts/run-action.sh"

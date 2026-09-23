@@ -81,8 +81,7 @@ pub struct PathsConfig {
 }
 
 impl PathsConfig {
-    /// True when nothing was set explicitly — used by `extends` to decide
-    /// whether the child overrode the parent's path globs or just left them.
+    /// True when the effective path configuration is the default.
     pub fn is_default(&self) -> bool {
         self.include == default_include_globs() && self.exclude.is_empty()
     }
@@ -184,14 +183,54 @@ fn default_true() -> bool {
 
 // ── loading ───────────────────────────────────────────────────────────────────
 
+/// Merge a child TOML document over its parent while preserving the documented
+/// collection semantics. Tables merge recursively, scalar/array values in the
+/// child override their parent, and rule-disable collections are unioned.
+///
+/// Merging before deserialisation preserves field presence. Comparing a
+/// deserialised child against Rust defaults cannot distinguish an omitted key
+/// from an explicitly configured default value, which is why domain sections
+/// were previously lost under `extends`.
+fn merge_config_values(parent: &mut toml::Value, child: toml::Value, path: &mut Vec<String>) {
+    match (parent, child) {
+        (toml::Value::Table(parent_table), toml::Value::Table(child_table)) => {
+            for (key, child_value) in child_table {
+                path.push(key.clone());
+                if let Some(parent_value) = parent_table.get_mut(&key) {
+                    merge_config_values(parent_value, child_value, path);
+                } else {
+                    parent_table.insert(key, child_value);
+                }
+                path.pop();
+            }
+        }
+        (toml::Value::Array(parent_items), toml::Value::Array(child_items))
+            if path.as_slice() == ["disable"]
+                || (path.len() == 2 && path[0] == "per_file_ignores") =>
+        {
+            for item in child_items {
+                if !parent_items.contains(&item) {
+                    parent_items.push(item);
+                }
+            }
+        }
+        (parent_value, child_value) => *parent_value = child_value,
+    }
+}
+
 impl Config {
     pub fn from_file(path: &Path) -> Result<Self> {
-        Self::from_file_inner(path, &mut Vec::new())
+        let merged = Self::from_file_inner(path, &mut Vec::new())?;
+        let mut cfg: Self = merged
+            .try_into()
+            .with_context(|| format!("Cannot parse config: {}", path.display()))?;
+        cfg.normalise();
+        Ok(cfg)
     }
 
     /// `seen` carries the inheritance chain so a cycle is reported rather than
     /// recursed into until the stack runs out.
-    fn from_file_inner(path: &Path, seen: &mut Vec<std::path::PathBuf>) -> Result<Self> {
+    fn from_file_inner(path: &Path, seen: &mut Vec<std::path::PathBuf>) -> Result<toml::Value> {
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if seen.contains(&canonical) {
             let chain: Vec<String> = seen
@@ -205,44 +244,27 @@ impl Config {
 
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("Cannot read config: {}", path.display()))?;
-        let mut cfg: Self = toml::from_str(&raw)
+        let mut child: toml::Value = toml::from_str(&raw)
             .with_context(|| format!("Cannot parse config: {}", path.display()))?;
 
-        if let Some(ref parent_ref) = cfg.extends.clone() {
+        let parent_ref = child
+            .get("extends")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned);
+        if let Some(parent_ref) = parent_ref {
             let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-            let parent_path = base_dir.join(parent_ref);
-            let parent = Self::from_file_inner(&parent_path, seen).with_context(|| {
+            let parent_path = base_dir.join(&parent_ref);
+            let mut parent = Self::from_file_inner(&parent_path, seen).with_context(|| {
                 format!(
                     "while resolving `extends = \"{parent_ref}\"` from {}",
                     path.display()
                 )
             })?;
-            cfg.inherit_from(parent);
+            merge_config_values(&mut parent, child, &mut Vec::new());
+            child = parent;
         }
 
-        cfg.normalise();
-        Ok(cfg)
-    }
-
-    /// Merge `parent` underneath `self`: anything this file did not set is
-    /// taken from the parent, and collections are unioned rather than replaced,
-    /// so extending a profile never silently drops its rules.
-    fn inherit_from(&mut self, parent: Self) {
-        for id in parent.disable {
-            self.disable.insert(id);
-        }
-        for (id, sev) in parent.severity_overrides {
-            self.severity_overrides.entry(id).or_insert(sev);
-        }
-        for (glob, ids) in parent.per_file_ignores {
-            self.per_file_ignores.entry(glob).or_insert(ids);
-        }
-        if self.min_severity.is_none() {
-            self.min_severity = parent.min_severity;
-        }
-        if self.paths.is_default() {
-            self.paths = parent.paths;
-        }
+        Ok(child)
     }
 
     /// Rules disabled for `path` by `[per_file_ignores]`.
@@ -373,6 +395,14 @@ impl Config {
 mod tests {
     use super::*;
 
+    fn config_tmpdir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("xray-config-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn known() -> Vec<&'static str> {
         vec!["XR001", "XR002", "NP003", "DK003", "IO001"]
     }
@@ -430,5 +460,90 @@ mod tests {
             .insert("XR001".to_string(), "error".to_string());
         let errs = cfg.validate(&known());
         assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn extends_inherits_domain_settings_and_merges_nested_keys() {
+        let dir = config_tmpdir("inherit-domains");
+        let parent = dir.join("parent.toml");
+        let child = dir.join("child.toml");
+        std::fs::write(
+            &parent,
+            r#"
+disable = ["XR001"]
+
+[per_file_ignores]
+"**/tests/**" = ["XR002"]
+
+[paths]
+include = ["parent/**/*.py"]
+exclude = ["parent/generated/**"]
+
+[xarray]
+values_access_is_error = true
+
+[dask]
+compute_call_threshold = 10
+
+[numpy]
+flag_iterrows = false
+
+[io]
+flag_missing_compression = false
+
+[job]
+script = "jobs/*.sh"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &child,
+            r#"
+extends = "parent.toml"
+disable = ["DK001"]
+
+[per_file_ignores]
+"**/tests/**" = ["DK002"]
+
+[paths]
+exclude = ["child/generated/**"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::from_file(&child).unwrap();
+        assert!(cfg.disable.contains("XR001"));
+        assert!(cfg.disable.contains("DK001"));
+        assert_eq!(cfg.paths.include, vec!["parent/**/*.py"]);
+        assert_eq!(cfg.paths.exclude, vec!["child/generated/**"]);
+        assert!(cfg.xarray.values_access_is_error);
+        assert_eq!(cfg.dask.compute_call_threshold, 10);
+        assert!(!cfg.numpy.flag_iterrows);
+        assert!(!cfg.io.flag_missing_compression);
+        assert_eq!(cfg.job.script.as_deref(), Some("jobs/*.sh"));
+        let ignored = &cfg.per_file_ignores["**/tests/**"];
+        assert!(ignored.contains(&"XR002".to_string()));
+        assert!(ignored.contains(&"DK002".to_string()));
+    }
+
+    #[test]
+    fn extends_respects_explicit_default_valued_overrides() {
+        let dir = config_tmpdir("explicit-defaults");
+        let parent = dir.join("parent.toml");
+        let child = dir.join("child.toml");
+        std::fs::write(
+            &parent,
+            "[paths]\ninclude = [\"parent/**/*.py\"]\n[xarray]\nvalues_access_is_error = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &child,
+            "extends = \"parent.toml\"\n[paths]\ninclude = [\"**/*.py\"]\n[xarray]\nvalues_access_is_error = false\n",
+        )
+        .unwrap();
+
+        let cfg = Config::from_file(&child).unwrap();
+        assert_eq!(cfg.paths.include, vec!["**/*.py"]);
+        assert!(!cfg.xarray.values_access_is_error);
     }
 }

@@ -193,7 +193,7 @@ fn lint_text(text: String, uri: &str, config: &Config) -> Vec<Value> {
         Ok(parsed) => {
             let mut diags = rules::run_all(&parsed, uri, config);
             runner::apply_config_filters(&mut diags, config);
-            xray_diags_to_lsp(diags)
+            xray_diags_to_lsp(diags, &parsed.source)
         }
         Err(_) => vec![],
     }
@@ -204,20 +204,22 @@ fn lint_path(path: &str, config: &Config) -> Vec<Value> {
         Ok(parsed) => {
             let mut diags = rules::run_all(&parsed, path, config);
             runner::apply_config_filters(&mut diags, config);
-            xray_diags_to_lsp(diags)
+            xray_diags_to_lsp(diags, &parsed.source)
         }
         Err(_) => vec![],
     }
 }
 
-fn xray_diags_to_lsp(diags: Vec<crate::diagnostic::Diagnostic>) -> Vec<Value> {
+fn xray_diags_to_lsp(diags: Vec<crate::diagnostic::Diagnostic>, source: &str) -> Vec<Value> {
     use crate::diagnostic::Severity;
+    let source_lines: Vec<&str> = source.lines().collect();
     diags
         .into_iter()
         .map(|d| {
-            // LSP lines are 0-based; xray lines are 1-based
+            // LSP lines are 0-based and character offsets are UTF-16 code
+            // units by default; tree-sitter reports UTF-8 byte columns.
             let line = d.line.saturating_sub(1) as u32;
-            let col = d.column.saturating_sub(1) as u32;
+            let col = utf16_column(&source_lines, d.line, d.column);
 
             let severity_code: u32 = match d.severity {
                 Severity::Error => 1,
@@ -245,6 +247,18 @@ fn xray_diags_to_lsp(diags: Vec<crate::diagnostic::Diagnostic>) -> Vec<Value> {
             lsp_diag
         })
         .collect()
+}
+
+/// Convert a 1-based tree-sitter byte column to a 0-based LSP UTF-16 column.
+fn utf16_column(lines: &[&str], line: usize, column: usize) -> u32 {
+    let Some(line_text) = lines.get(line.saturating_sub(1)) else {
+        return 0;
+    };
+    let mut byte = column.saturating_sub(1).min(line_text.len());
+    while !line_text.is_char_boundary(byte) {
+        byte = byte.saturating_sub(1);
+    }
+    line_text[..byte].encode_utf16().count() as u32
 }
 
 fn publish_diagnostics_notification(uri: &str, diagnostics: Vec<Value>) -> Value {
@@ -367,7 +381,7 @@ mod tests {
             Diagnostic::new("XR002", Severity::Warning, "f.py", 2, 1, "warn"),
             Diagnostic::new("XR003", Severity::Hint, "f.py", 3, 1, "hint"),
         ];
-        let lsp = xray_diags_to_lsp(diags);
+        let lsp = xray_diags_to_lsp(diags, "x\nx\nx\n");
         assert_eq!(lsp[0]["severity"], 1); // Error
         assert_eq!(lsp[1]["severity"], 2); // Warning
         assert_eq!(lsp[2]["severity"], 4); // Hint
@@ -377,8 +391,20 @@ mod tests {
     fn xray_diag_line_converted_to_zero_based() {
         use crate::diagnostic::{Diagnostic, Severity};
         let d = Diagnostic::new("XR001", Severity::Warning, "f.py", 10, 5, "msg");
-        let lsp = xray_diags_to_lsp(vec![d]);
+        let source = "0123456789\n".repeat(10);
+        let lsp = xray_diags_to_lsp(vec![d], &source);
         assert_eq!(lsp[0]["range"]["start"]["line"], 9); // 10 - 1
         assert_eq!(lsp[0]["range"]["start"]["character"], 4); // 5 - 1
+    }
+
+    #[test]
+    fn xray_diag_column_is_converted_from_utf8_bytes_to_utf16() {
+        use crate::diagnostic::{Diagnostic, Severity};
+        let source = "import numpy as np\n\"é\"; x = np.zeros((2, 2))\n";
+        // `n` in `np.zeros` starts at UTF-8 byte 10 (1-based column 11), but
+        // only nine UTF-16 code units precede it.
+        let d = Diagnostic::new("NP003", Severity::Hint, "f.py", 2, 11, "msg");
+        let lsp = xray_diags_to_lsp(vec![d], source);
+        assert_eq!(lsp[0]["range"]["start"]["character"], 9);
     }
 }
