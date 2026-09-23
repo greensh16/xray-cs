@@ -2350,12 +2350,12 @@ fn job_rules_stay_quiet_when_a_directive_cannot_be_read() {
 }
 
 #[test]
-fn every_v12_rule_is_listed_and_explained() {
+fn every_current_rule_is_listed_and_explained() {
     let meta = rules::all_meta();
     let ids: Vec<&str> = meta.iter().map(|m| m.id).collect();
     for rule in [
-        "XR012", "DK010", "PD001", "PD002", "PD003", "PD004", "PD005", "SP001", "SP002", "JOB001",
-        "JOB002", "JOB003", "JOB004", "JOB005",
+        "XR012", "DK010", "DK011", "PD001", "PD002", "PD003", "PD004", "PD005", "SP001", "SP002",
+        "JOB001", "JOB002", "JOB003", "JOB004", "JOB005",
     ] {
         assert!(ids.contains(&rule), "{rule} missing from --list-rules");
         assert!(
@@ -2363,8 +2363,36 @@ fn every_v12_rule_is_listed_and_explained() {
             "{rule} has no `xray explain` entry"
         );
     }
-    // The roadmap's v1.2 target: 33 rules grow to 47, plus cross-domain XR000.
-    assert_eq!(meta.len(), 48, "rule count changed: {ids:?}");
+    // 48 library/job rules, plus cross-domain XR000.
+    assert_eq!(meta.len(), 49, "rule count changed: {ids:?}");
+}
+
+#[test]
+fn dask_setup_uses_dask_rules_without_conflicting_xarray_advice() {
+    let source = r#"
+from dask_setup import setup_dask_client
+import xarray as xr
+
+client, cluster, tmp = setup_dask_client(workload_type="io")
+ds = xr.open_mfdataset("era5_*.nc", engine="netcdf4", chunks="auto")
+for item in items:
+    item.compute()
+"#;
+    let parsed = parser::parse_source(source.to_string()).unwrap();
+    let diags = rules::run_all(&parsed, "<inline>", &Config::default());
+    let ids: Vec<_> = diags.iter().map(|d| d.rule_id).collect();
+    assert!(
+        ids.contains(&"DK001"),
+        "dask rules were not activated: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"DK011"),
+        "dask_setup mismatch was missed: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"XR008"),
+        "XR008 must not recommend parallel NetCDF reads under io mode: {ids:?}"
+    );
 }
 
 // ── notebooks ─────────────────────────────────────────────────────────────────
@@ -2406,6 +2434,19 @@ fn notebook_imports_cross_cell_boundaries() {
     assert!(
         found.contains(&(4, "SP001")),
         "SP001 needs both the scipy flag and the `integrate` alias from cell 1; got {found:?}"
+    );
+}
+
+#[test]
+fn notebook_dask_setup_workload_crosses_cell_boundaries() {
+    let findings = check_notebook_fixture("dask_setup_notebook.ipynb");
+    assert!(
+        findings.contains(&(2, "DK011")),
+        "cell 2 should inherit the dask_setup import and workload semantics: {findings:?}"
+    );
+    assert!(
+        !findings.contains(&(2, "XR008")),
+        "cell 2 must not receive conflicting parallel=True advice: {findings:?}"
     );
 }
 

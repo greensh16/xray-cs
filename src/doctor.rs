@@ -92,16 +92,17 @@ pub fn doctor(path: &str, cli: &Cli, config: &Config) -> Result<()> {
     let imports = &parsed.imports;
 
     println!("\nIMPORTS (top-level only)");
-    let flags: [(&str, bool); 9] = [
+    let flags: [(&str, bool); 10] = [
         ("xarray", imports.xarray),
         ("dask", imports.dask),
+        ("dask_setup", imports.dask_setup),
         ("numpy", imports.numpy),
         ("pandas", imports.pandas),
         ("scipy", imports.scipy),
         ("netCDF4", imports.netcdf4),
         ("zarr", imports.zarr),
         ("h5py", imports.h5py),
-        ("a GPU library", imports.gpu),
+        ("GPU intent", imports.gpu),
     ];
     let detected: Vec<&str> = flags
         .iter()
@@ -126,7 +127,7 @@ pub fn doctor(path: &str, cli: &Cli, config: &Config) -> Result<()> {
     println!("\nRULE DOMAINS");
     for (domain, gated) in [
         ("xarray  (XR001–XR012)", imports.xarray),
-        ("dask    (DK001–DK010)", imports.dask),
+        ("dask    (DK001–DK011)", imports.dask || imports.dask_setup),
         ("numpy   (NP001–NP007)", imports.numpy || imports.pandas),
         ("pandas  (PD001–PD005)", imports.pandas),
         ("scipy   (SP001–SP002)", imports.scipy),

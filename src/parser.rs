@@ -20,18 +20,24 @@ pub struct ParsedFile {
 pub struct ImportContext {
     pub xarray: bool,
     pub dask: bool,
+    /// The project imports `dask_setup`, whose client and topology helpers
+    /// imply a Dask workload even when `dask` itself is never imported.
+    pub dask_setup: bool,
     pub numpy: bool,
     pub pandas: bool,
     pub netcdf4: bool,
     pub zarr: bool,
     pub h5py: bool,
     pub scipy: bool,
-    /// Any library that only makes sense on a GPU is imported.
+    /// Any library or statically resolved helper configuration that only makes
+    /// sense on a GPU is present.
     ///
     /// Not a rule domain of its own — JOB004 uses it to answer "was the GPU
     /// this job asked for ever going to be touched?". Deliberately generous:
     /// torch and tensorflow have CPU-only builds, but a script that imports
     /// one and requests a GPU is not the mistake JOB004 exists to catch.
+    /// `setup_dask_client(..., workload_type="gpu")` also counts because
+    /// dask_setup owns GPU worker construction even without a direct CuPy import.
     pub gpu: bool,
     /// Binding name → canonical top-level module.
     /// `import xarray as xr` → `"xr" → "xarray"`;
@@ -45,9 +51,38 @@ pub struct ImportContext {
     /// Name bound by `from <module> import <name>` → that module.
     /// `from xarray import concat` → `"concat" → "xarray"`.
     pub from_imports: HashMap<String, String>,
+    dask_setup_workload: DaskSetupWorkload,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum DaskSetupWorkload {
+    #[default]
+    Unset,
+    Cpu,
+    Io,
+    Mixed,
+    Gpu,
+    Unknown,
+}
+
+impl DaskSetupWorkload {
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unset, value) | (value, Self::Unset) => value,
+            (left, right) if left == right => left,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 impl ImportContext {
+    /// Whether a statically resolvable `dask_setup` client uses its threaded
+    /// I/O topology. This matters for NetCDF/HDF5, whose process-wide lock
+    /// makes that topology serialize reads.
+    pub fn dask_setup_uses_io(&self) -> bool {
+        self.dask_setup_workload == DaskSetupWorkload::Io
+    }
+
     /// The module a receiver identifier refers to, if it is an imported alias.
     pub fn module_of_binding(&self, binding: &str) -> Option<&str> {
         self.aliases.get(binding).map(String::as_str)
@@ -95,6 +130,7 @@ impl ImportContext {
         let Self {
             xarray,
             dask,
+            dask_setup,
             numpy,
             pandas,
             netcdf4,
@@ -104,10 +140,12 @@ impl ImportContext {
             gpu,
             aliases,
             from_imports,
+            dask_setup_workload,
         } = other;
 
         self.xarray |= xarray;
         self.dask |= dask;
+        self.dask_setup |= dask_setup;
         self.numpy |= numpy;
         self.pandas |= pandas;
         self.netcdf4 |= netcdf4;
@@ -115,6 +153,7 @@ impl ImportContext {
         self.h5py |= h5py;
         self.scipy |= scipy;
         self.gpu |= gpu;
+        self.dask_setup_workload = self.dask_setup_workload.merge(*dask_setup_workload);
 
         for (binding, module) in aliases {
             self.aliases
@@ -214,7 +253,83 @@ impl ImportContext {
                 _ => {}
             }
         }
+        ctx.detect_dask_setup_usage(root, source);
         ctx
+    }
+
+    /// Enrich an already-merged import context with calls in this syntax tree.
+    /// Notebook cells need this second pass because the import may live in an
+    /// earlier cell while `setup_dask_client(...)` lives in a later one.
+    pub(crate) fn detect_dask_setup_usage(&mut self, root: Node<'_>, source: &[u8]) {
+        if !self.dask_setup {
+            return;
+        }
+
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+            if node.kind() != "call" || call_module(node, source, self) != Some("dask_setup") {
+                continue;
+            }
+            let Some(name) = call_terminal_name(node, source) else {
+                continue;
+            };
+
+            let workload_node =
+                keyword_arg_value_node(node, source, "workload_type").or_else(|| {
+                    if name == "setup_dask_client" {
+                        first_positional_arg(node)
+                    } else {
+                        None
+                    }
+                });
+            let explicit_workload = workload_node.map(|n| dask_setup_workload(n, source));
+
+            // A GPU topology is itself evidence that the requested device will
+            // be used. Users should not need a redundant direct CuPy import to
+            // silence JOB004 when dask_setup owns GPU worker construction.
+            if explicit_workload == Some(DaskSetupWorkload::Gpu) {
+                self.gpu = true;
+            }
+
+            let observed = match name {
+                "setup_dask_client" | "DaskClientContext" => {
+                    explicit_workload.unwrap_or_else(|| {
+                        if has_keyword_arg(node, source, "profile")
+                            || has_keyword_arg(node, source, "config")
+                            || has_keyword_arg(node, source, "multi_node_config")
+                            || has_dictionary_splat(node)
+                        {
+                            DaskSetupWorkload::Unknown
+                        } else {
+                            // dask_setup 2.x resolves an otherwise unspecified
+                            // workload to its library default, `"io"`.
+                            DaskSetupWorkload::Io
+                        }
+                    })
+                }
+                "setup_pbs_cluster" | "setup_slurm_cluster" | "setup_interactive_cluster" => {
+                    explicit_workload.unwrap_or_else(|| {
+                        if has_keyword_arg(node, source, "config")
+                            || first_positional_arg(node).is_some()
+                            || has_dictionary_splat(node)
+                        {
+                            DaskSetupWorkload::Unknown
+                        } else {
+                            // The direct multi-node helpers default to their
+                            // MultiNodeConfig CPU topology.
+                            DaskSetupWorkload::Cpu
+                        }
+                    })
+                }
+                // Constructing a config is enough to establish GPU intent for
+                // JOB004, but not enough to prove which client consumes it.
+                "DaskSetupConfig" | "MultiNodeConfig" => DaskSetupWorkload::Unset,
+                _ => DaskSetupWorkload::Unset,
+            };
+            self.dask_setup_workload = self.dask_setup_workload.merge(observed);
+        }
     }
 
     fn mark_by_name(ctx: &mut Self, module: &str) {
@@ -222,6 +337,7 @@ impl ImportContext {
         match module {
             "xarray" => ctx.xarray = true,
             "dask" => ctx.dask = true,
+            "dask_setup" => ctx.dask_setup = true,
             "numpy" => ctx.numpy = true,
             "pandas" => ctx.pandas = true,
             "netCDF4" | "netcdf4" => ctx.netcdf4 = true,
@@ -233,6 +349,45 @@ impl ImportContext {
         if GPU_MODULES.contains(&module) {
             ctx.gpu = true;
         }
+    }
+}
+
+fn call_terminal_name<'a>(call: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    let function = call.child_by_field_name("function")?;
+    let name = match function.kind() {
+        "identifier" => function,
+        "attribute" => function.child_by_field_name("attribute")?,
+        _ => return None,
+    };
+    Some(node_text(&name, source))
+}
+
+fn first_positional_arg(call: Node<'_>) -> Option<Node<'_>> {
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    arguments.named_children(&mut cursor).find(|arg| {
+        !matches!(
+            arg.kind(),
+            "keyword_argument" | "list_splat" | "dictionary_splat"
+        )
+    })
+}
+
+fn dask_setup_workload(node: Node<'_>, source: &[u8]) -> DaskSetupWorkload {
+    let value = node_text(&node, source).trim();
+    let value = value
+        .strip_prefix(['r', 'R', 'u', 'U'])
+        .unwrap_or(value)
+        .trim_matches(['\'', '"'])
+        .to_ascii_lowercase();
+    match value.as_str() {
+        "cpu" => DaskSetupWorkload::Cpu,
+        "io" => DaskSetupWorkload::Io,
+        "mixed" => DaskSetupWorkload::Mixed,
+        "gpu" => DaskSetupWorkload::Gpu,
+        // `auto`, variables and expressions cannot establish a static
+        // topology. Keep xray quiet rather than guessing.
+        _ => DaskSetupWorkload::Unknown,
     }
 }
 
@@ -721,6 +876,43 @@ mod tests {
             Some("numpy"),
             "an earlier cell's binding must win, so the merge is order-stable"
         );
+    }
+
+    #[test]
+    fn dask_setup_imports_and_workloads_are_recognised() {
+        let io = parse_source(
+            "from dask_setup import setup_dask_client\nclient, cluster, tmp = setup_dask_client()\n"
+                .to_string(),
+        )
+        .unwrap();
+        assert!(io.imports.dask_setup);
+        assert!(!io.imports.dask, "dask itself was not imported");
+        assert!(io.imports.dask_setup_uses_io());
+
+        let cpu = parse_source(
+            "import dask_setup as helpers\nhelpers.setup_dask_client('cpu')\n".to_string(),
+        )
+        .unwrap();
+        assert!(cpu.imports.dask_setup);
+        assert!(!cpu.imports.dask_setup_uses_io());
+
+        let configured = parse_source(
+            "from dask_setup import setup_dask_client\nsetup_dask_client(profile='climate_analysis')\n"
+                .to_string(),
+        )
+        .unwrap();
+        assert!(!configured.imports.dask_setup_uses_io());
+    }
+
+    #[test]
+    fn dask_setup_gpu_workload_counts_as_gpu_intent() {
+        for source in [
+            "from dask_setup import setup_dask_client\nsetup_dask_client(workload_type='gpu')\n",
+            "import dask_setup as ds\nds.DaskSetupConfig(workload_type=\"gpu\")\n",
+        ] {
+            let parsed = parse_source(source.to_string()).unwrap();
+            assert!(parsed.imports.gpu, "GPU intent missed in {source}");
+        }
     }
 
     #[test]

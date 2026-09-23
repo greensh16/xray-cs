@@ -12,8 +12,8 @@ use crate::{
     },
 };
 
-use super::RuleSet;
 use super::chunks::{ChunkVerdict, classify_chunk_spec};
+use super::{RuleSet, is_netcdf_xarray_open};
 
 pub struct DaskRules;
 
@@ -114,6 +114,12 @@ impl RuleSet for DaskRules {
                 name: "pathological-rechunk",
                 severity: Severity::Warning,
                 description: ".rechunk() to a literal chunk of 1 or a trivially small chunk — pays a full shuffle to arrive at a task per element",
+            },
+            RuleMeta {
+                id: "DK011",
+                name: "dask-setup-io-netcdf",
+                severity: Severity::Warning,
+                description: "dask_setup workload_type=\"io\" paired with NetCDF/HDF5 input — one threaded worker serialises on the backend lock",
             },
         ]
     }
@@ -402,6 +408,33 @@ impl RuleSet for DaskRules {
                     }
                 }
 
+                // DK011 — dask_setup's threaded I/O topology with NetCDF.
+                10 if !config.is_disabled("DK011") && file.imports.dask_setup_uses_io() => {
+                    if let Some(call_node) = query
+                        .capture_index_for_name("dk_dask_setup_open_call")
+                        .and_then(|i| m.nodes_for_capture_index(i).next())
+                    {
+                        if !is_netcdf_xarray_open(call_node, source, &file.imports) {
+                            continue;
+                        }
+                        let (line, col) = position(&call_node);
+                        diags.push(
+                            Diagnostic::new(
+                                "DK011",
+                                Severity::Warning,
+                                path,
+                                line,
+                                col,
+                                "`dask_setup` uses one threaded worker for `workload_type=\"io\"`, but NetCDF/HDF5 reads serialise on a process-wide lock",
+                            )
+                            .with_suggestion(
+                                "Use `workload_type=\"cpu\"` for NetCDF/HDF5 so separate worker processes can read concurrently; reserve `\"io\"` for Zarr, object storage, and other thread-friendly backends",
+                            )
+                            .with_url("https://github.com/21centuryweather/dask_setup#reading-netcdf-use-cpu-not-io"),
+                        );
+                    }
+                }
+
                 _ => {}
             }
         }
@@ -629,6 +662,42 @@ mod tests {
         let ids = ids(&format!("{IMPORTS}for p in parts:\n    arr.rechunk(1)\n"));
         assert!(ids.contains(&"DK008"), "{ids:?}");
         assert!(ids.contains(&"DK010"), "{ids:?}");
+    }
+
+    #[test]
+    fn dk011_understands_dask_setup_workloads() {
+        let netcdf = |setup: &str| {
+            format!(
+                "from dask_setup import setup_dask_client\nimport xarray as xr\n{setup}\nds = xr.open_mfdataset('*.nc', engine='netcdf4', chunks={{}})\n"
+            )
+        };
+        assert!(fires(
+            "DK011",
+            &netcdf("client, cluster, tmp = setup_dask_client(workload_type='io')")
+        ));
+        assert!(fires(
+            "DK011",
+            &netcdf("client, cluster, tmp = setup_dask_client()")
+        ));
+        assert!(!fires(
+            "DK011",
+            &netcdf("client, cluster, tmp = setup_dask_client(workload_type='cpu')")
+        ));
+        assert!(!fires(
+            "DK011",
+            &netcdf("client, cluster, tmp = setup_dask_client(profile='climate_analysis')")
+        ));
+
+        let zarr = "import dask_setup as ds\nimport xarray as xr\nclient, cluster, tmp = ds.setup_dask_client('io')\ndata = xr.open_dataset('store.zarr', engine='zarr', chunks={})\n";
+        assert!(!fires("DK011", zarr));
+    }
+
+    #[test]
+    fn dask_setup_import_activates_method_rules() {
+        assert!(fires(
+            "DK001",
+            "from dask_setup import setup_dask_client\nfor item in items:\n    item.compute()\n"
+        ));
     }
 
     #[test]

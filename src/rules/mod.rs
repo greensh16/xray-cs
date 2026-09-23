@@ -16,6 +16,64 @@ use crate::{
     parser::ParsedFile,
 };
 
+/// Is this an xarray NetCDF/HDF5 open that will contend on the process-wide
+/// backend lock under dask_setup's threaded `workload_type="io"` topology?
+///
+/// `open_mfdataset` is NetCDF-oriented unless an explicit non-NetCDF engine
+/// says otherwise. For `open_dataset`, require a NetCDF engine or a recognisable
+/// filename so arbitrary backends are not guessed at.
+pub(crate) fn is_netcdf_xarray_open(
+    call: tree_sitter::Node<'_>,
+    source: &[u8],
+    imports: &crate::parser::ImportContext,
+) -> bool {
+    if !crate::parser::call_is_from(call, source, imports, "xarray") {
+        return false;
+    }
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    let name_node = match function.kind() {
+        "identifier" => function,
+        "attribute" => match function.child_by_field_name("attribute") {
+            Some(node) => node,
+            None => return false,
+        },
+        _ => return false,
+    };
+    let name = crate::parser::node_text(&name_node, source);
+    if !matches!(name, "open_dataset" | "open_mfdataset") {
+        return false;
+    }
+
+    if let Some(engine) = crate::parser::keyword_arg_value(call, source, "engine") {
+        let engine = engine.trim_matches(['\'', '"']).to_ascii_lowercase();
+        return matches!(engine.as_str(), "netcdf4" | "h5netcdf" | "scipy");
+    }
+
+    let path_node = ["filename_or_obj", "paths", "path"]
+        .into_iter()
+        .find_map(|kw| crate::parser::keyword_arg_value_node(call, source, kw))
+        .or_else(|| {
+            let arguments = call.child_by_field_name("arguments")?;
+            let mut cursor = arguments.walk();
+            arguments
+                .named_children(&mut cursor)
+                .find(|arg| arg.kind() != "keyword_argument")
+        });
+    if let Some(path) = path_node {
+        let text = crate::parser::node_text(&path, source).to_ascii_lowercase();
+        if text.contains(".zarr") {
+            return false;
+        }
+        if text.contains(".nc") || text.contains(".cdf") || text.contains(".h5") {
+            return true;
+        }
+    }
+
+    name == "open_mfdataset"
+}
+
 /// Every rule set implements this trait.
 pub trait RuleSet {
     fn meta() -> Vec<RuleMeta>
@@ -54,7 +112,7 @@ pub fn run_all_with_job(
     if file.imports.xarray {
         out.extend(xarray::XarrayRules::check(file, path, config));
     }
-    if file.imports.dask {
+    if file.imports.dask || file.imports.dask_setup {
         out.extend(dask::DaskRules::check(file, path, config));
     }
     if file.imports.numpy || file.imports.pandas {

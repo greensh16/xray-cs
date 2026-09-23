@@ -807,6 +807,37 @@ arr = arr.rechunk(\"auto\")         # let dask pick",
         url: Some("https://docs.dask.org/en/stable/generated/dask.array.rechunk.html"),
         fix_eligible: false,
     },
+    ExplainEntry {
+        id: "DK011",
+        name: "dask-setup-io-netcdf",
+        severity: "warning",
+        domain: "dask",
+        rationale: "\
+`dask_setup` deliberately gives workload_type=\"io\" one worker process with
+many threads. That is a good topology for Zarr and object storage, whose codecs
+and clients can overlap work across threads. NetCDF4/HDF5 is different: xarray
+serialises access through a process-wide lock, so all those threads queue behind
+one another. Separate worker processes each get their own lock, which is why
+`dask_setup` recommends workload_type=\"cpu\" for NetCDF input.
+
+xray reports this only when it can resolve both the dask_setup workload and the
+xarray backend statically. Named profiles, config objects, `**kwargs`, and
+non-literal workload values remain unknown and are left alone.",
+        bad_example: "\
+from dask_setup import setup_dask_client
+client, cluster, tmp = setup_dask_client(workload_type=\"io\")
+ds = xr.open_mfdataset(\"era5_*.nc\", engine=\"netcdf4\", chunks=\"auto\")",
+        good_example: "\
+from dask_setup import setup_dask_client
+client, cluster, tmp = setup_dask_client(workload_type=\"cpu\")
+ds = xr.open_mfdataset(\"era5_*.nc\", engine=\"netcdf4\", chunks=\"auto\")
+
+# Keep the threaded I/O topology for a thread-friendly Zarr store.
+client, cluster, tmp = setup_dask_client(workload_type=\"io\")
+ds = xr.open_zarr(\"era5.zarr\", chunks=\"auto\")",
+        url: Some("https://github.com/21centuryweather/dask_setup#reading-netcdf-use-cpu-not-io"),
+        fix_eligible: false,
+    },
     // ── pandas ────────────────────────────────────────────────────────────────
     ExplainEntry {
         id: "PD001",

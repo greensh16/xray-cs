@@ -137,3 +137,18 @@
   )
   arguments: (argument_list) @dk_rechunk_spec_args
 ) @dk_rechunk_spec_call
+
+
+; DK011 — xarray NetCDF/HDF5 reads to cross-check against dask_setup's
+; resolved workload topology. Rust verifies both the imported modules and the
+; backend/path before reporting.
+(call
+  function: [
+    (attribute
+      attribute: (identifier) @dk_dask_setup_open_attr
+      (#match? @dk_dask_setup_open_attr "^(open_dataset|open_mfdataset)$")
+    )
+    (identifier) @dk_dask_setup_open_bare
+    (#match? @dk_dask_setup_open_bare "^(open_dataset|open_mfdataset)$")
+  ]
+) @dk_dask_setup_open_call

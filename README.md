@@ -13,9 +13,9 @@
 
 
 A fast, self-contained Rust linter for scientific Python workflows on HPC systems.
-Targets **xarray**, **dask**, **NumPy**, **pandas**, **SciPy** and **scientific I/O**
-patterns that general-purpose linters (ruff, pylint) don't cover — and reads your
-**HPC submission script** alongside the Python it launches.
+Targets **xarray**, **dask**, **dask_setup**, **NumPy**, **pandas**, **SciPy** and
+**scientific I/O** patterns that general-purpose linters (ruff, pylint) don't
+cover — and reads your **HPC submission script** alongside the Python it launches.
 
 **Zero Python runtime required** — ships as a single binary. Runs on Gadi, Setonix,
 or any HPC cluster without loading a Python module.
@@ -34,7 +34,7 @@ Or download a pre-built binary from the [releases page](https://github.com/green
 no Rust toolchain needed, which is usually what you want on a login node:
 
 ```bash
-curl -L https://github.com/greensh16/xray-cs/releases/download/v1.3.0/xray-linux-x86_64 \
+curl -L https://github.com/greensh16/xray-cs/releases/download/v1.3.1/xray-linux-x86_64 \
   -o ~/.local/bin/xray && chmod +x ~/.local/bin/xray
 ```
 
@@ -72,17 +72,27 @@ Results are cached in `.xray-cache`, so a re-run over unchanged files skips the
 parse and the rule pass entirely — around 17× faster on a clean corpus. Add it to
 `.gitignore`; `xray clean` deletes it.
 
+### `dask_setup` on Gadi
+
+xray recognises [`dask_setup`](https://github.com/21centuryweather/dask_setup)
+imports as Dask workloads, including aliases and Jupyter cells. Existing DK
+rules therefore work even when your script never imports `dask` directly.
+It also understands `setup_dask_client` and `DaskClientContext` workload
+selection: GPU mode satisfies JOB004, while DK011 catches the threaded `"io"`
+topology paired with NetCDF/HDF5 input. In that case XR008 will not suggest the
+conflicting `parallel=True` rewrite.
+
 ---
 
 ## Rules
 
-**47 rules** across six library domains plus the HPC job-script domain, and one
+**48 rules** across six library domains plus the HPC job-script domain, and one
 cross-domain check. All IDs are stable.
 
 | Domain | IDs | Covers |
 |--------|-----|--------|
 | **XR** | XR001–XR012 | Eager loads, `.values`, loops over dimensions, pathological chunk sizes |
-| **DK** | DK001–DK010 | `.compute()` in loops, `.persist()` misuse, unchunked arrays, bad rechunks |
+| **DK** | DK001–DK011 | `.compute()` in loops, `.persist()` misuse, bad rechunks, `dask_setup` topology |
 | **NP** | NP001–NP007 | Vectorisation anti-patterns, missing `dtype=`, deprecated APIs |
 | **PD** | PD001–PD005 | Nested `iterrows()`, removed `.append()`, chained assignment, CSV I/O |
 | **SP** | SP001–SP002 | `quad()` in loops, explicit matrix inversion |
@@ -127,7 +137,7 @@ Run `xray init` for an annotated template covering every section.
 
 | Page | |
 |------|---|
-| [Rule reference](https://github.com/greensh16/xray-cs/wiki/Rule-Reference) | All 47 rules, rationale and examples |
+| [Rule reference](https://github.com/greensh16/xray-cs/wiki/Rule-Reference) | All 48 rules, rationale and examples |
 | [HPC job script rules](https://github.com/greensh16/xray-cs/wiki/Job-Rules) | `--job` — checking `#SBATCH` / `#PBS` against your Python |
 | [Configuration](https://github.com/greensh16/xray-cs/wiki/Configuration) | Full `xray.toml` schema, env vars, CLI reference |
 | [Suppressions](https://github.com/greensh16/xray-cs/wiki/Suppressions) | Silencing a rule for a line, file, path or project |

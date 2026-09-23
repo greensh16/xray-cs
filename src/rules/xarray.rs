@@ -15,8 +15,8 @@ use crate::{
     },
 };
 
-use super::RuleSet;
 use super::chunks::{ChunkVerdict, classify_chunk_spec};
+use super::{RuleSet, is_netcdf_xarray_open};
 
 pub struct XarrayRules;
 
@@ -431,6 +431,16 @@ impl RuleSet for XarrayRules {
                         if fn_name != "open_mfdataset" {
                             continue;
                         }
+                        // dask_setup documents the opposite topology for
+                        // NetCDF/HDF5: its `io` mode is one threaded worker,
+                        // and concurrent metadata reads contend on the
+                        // backend's process-wide lock. DK011 explains the
+                        // mismatch; do not also offer a harmful auto-fix.
+                        if file.imports.dask_setup_uses_io()
+                            && is_netcdf_xarray_open(call_node, source, &file.imports)
+                        {
+                            continue;
+                        }
                         // Check that parallel= is absent or not True
                         let parallel_val = keyword_arg_value(call_node, source, "parallel");
                         let already_parallel = parallel_val.map(|v| v == "True").unwrap_or(false);
@@ -801,6 +811,10 @@ mod tests {
         assert!(!fires(
             "XR008",
             &format!("{IMPORTS}ds = xr.open_mfdataset('*.nc', chunks='auto', parallel=True)\n")
+        ));
+        assert!(!fires(
+            "XR008",
+            "import xarray as xr\nfrom dask_setup import setup_dask_client\nsetup_dask_client(workload_type='io')\nds = xr.open_mfdataset('*.nc', chunks='auto')\n"
         ));
     }
 

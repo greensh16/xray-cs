@@ -57,9 +57,9 @@ use crate::{
 /// Default cache location, relative to the working directory.
 pub const CACHE_FILE: &str = ".xray-cache";
 
-/// Bumped when the on-disk shape changes incompatibly. An older or newer
-/// version is treated as a miss, not an error.
-const CACHE_FORMAT_VERSION: u32 = 2;
+/// Bumped when the on-disk shape or cached diagnostic semantics change. An
+/// older or newer version is treated as a miss, not an error.
+const CACHE_FORMAT_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct CacheFile {

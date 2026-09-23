@@ -95,6 +95,18 @@ pub fn parse_notebook(path: &str) -> Result<Vec<NotebookCell>> {
         for cell in &notebook_cells {
             merged.merge_from(&cell.parsed.imports);
         }
+        // Calls in one cell may rely on a dask_setup import from another.
+        // Re-scan with the notebook-wide alias table before freezing the
+        // context shared by every cell.
+        let imported = merged.clone();
+        for cell in &notebook_cells {
+            let mut contextual = imported.clone();
+            contextual.detect_dask_setup_usage(
+                cell.parsed.tree.root_node(),
+                cell.parsed.source.as_bytes(),
+            );
+            merged.merge_from(&contextual);
+        }
         for cell in &mut notebook_cells {
             let imports = merged.clone();
             // Bindings classify assignment origins using the import table.

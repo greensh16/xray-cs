@@ -618,6 +618,18 @@ mod tests {
     }
 
     #[test]
+    fn job004_accepts_dask_setup_gpu_topology_as_gpu_use() {
+        let gpu = parse_job_source("#PBS -l ngpus=1\n", "run.sh");
+        let parsed = parse_source(
+            "from dask_setup import setup_dask_client\nsetup_dask_client(workload_type='gpu')\n"
+                .to_string(),
+        )
+        .unwrap();
+        assert!(parsed.imports.gpu);
+        assert!(job004(parsed.imports.gpu, &gpu, &Config::default()).is_none());
+    }
+
+    #[test]
     fn job004_reports_against_the_job_script_not_the_python() {
         let job = parse_job_source("#SBATCH --gres=gpu:1\n", "run.sh");
         let d = job004(false, &job, &Config::default()).unwrap();
